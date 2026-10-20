@@ -1,0 +1,205 @@
+use std::process::Child;
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::Rect;
+use ratatui::style::{Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
+
+use crate::data_structures::Theme;
+use crate::helpers;
+
+/// Keep streaming output bounded so `logs -f` can run for hours.
+const MAX_LINES: usize = 20_000;
+pub const DEFAULT_WATCH: Duration = Duration::from_secs(2);
+
+pub enum ViewerAction {
+    None,
+    Close,
+    Rerun,
+}
+
+/// Full-screen scrollable output of one command: a one-shot capture (optionally
+/// re-run on an interval, like `watch`) or a live stream (`logs -f`, `get -w`).
+pub struct Viewer {
+    pub title: String,
+    pub argv: Vec<String>,
+    pub generation: u64,
+    /// Journal entry of the run currently shown.
+    pub journal: u64,
+    pub watch: Option<Duration>,
+    loading: bool,
+    lines: Vec<String>,
+    is_error: bool,
+    scroll: usize,
+    hscroll: u16,
+    follow: bool,
+    height: usize,
+    stream: Option<Child>,
+    stream_ended: bool,
+    last_run: Instant,
+}
+
+impl Viewer {
+    pub fn new(title: String, argv: Vec<String>, generation: u64) -> Self {
+        Self {
+            title,
+            argv,
+            generation,
+            journal: 0,
+            watch: None,
+            loading: false,
+            lines: Vec::new(),
+            is_error: false,
+            scroll: 0,
+            hscroll: 0,
+            follow: false,
+            height: 0,
+            stream: None,
+            stream_ended: false,
+            last_run: Instant::now(),
+        }
+    }
+
+    pub fn attach_stream(&mut self, child: Child) {
+        self.stream = Some(child);
+        self.follow = true;
+    }
+
+    pub fn mark_running(&mut self) {
+        self.loading = true;
+        self.last_run = Instant::now();
+    }
+
+    pub fn watch_due(&self) -> bool {
+        matches!(self.watch, Some(interval) if !self.loading && self.stream.is_none() && self.last_run.elapsed() >= interval)
+    }
+
+    pub fn set_output(&mut self, result: Result<String, String>) {
+        self.loading = false;
+        self.is_error = result.is_err();
+        let text = result.unwrap_or_else(|e| e);
+        self.lines = text.lines().map(helpers::sanitize_line).collect();
+        if self.lines.is_empty() {
+            self.lines.push("(no output)".into());
+        }
+        // Watch mode re-renders in place, so keep the scroll position where possible.
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn push_line(&mut self, line: &str) {
+        self.lines.push(helpers::sanitize_line(line));
+        if self.lines.len() > MAX_LINES {
+            let excess = self.lines.len() - MAX_LINES;
+            self.lines.drain(..excess);
+            self.scroll = self.scroll.saturating_sub(excess);
+        }
+    }
+
+    pub fn end_stream(&mut self) {
+        self.stream_ended = true;
+        self.push_line("── stream ended ──");
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> ViewerAction {
+        let page = self.height.max(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return ViewerAction::Close,
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('d') => self.scroll_by(page as isize),
+            KeyCode::PageUp | KeyCode::Char('u') => self.scroll_by(-(page as isize)),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_by(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => {
+                self.scroll = self.max_scroll();
+                self.follow = self.stream.is_some();
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.hscroll = self.hscroll.saturating_sub(8),
+            KeyCode::Right | KeyCode::Char('l') => self.hscroll = self.hscroll.saturating_add(8),
+            KeyCode::Char('f') if self.stream.is_some() => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.scroll = self.max_scroll();
+                }
+            }
+            KeyCode::Char('w') if self.stream.is_none() => {
+                self.watch = match self.watch {
+                    Some(_) => None,
+                    None => Some(DEFAULT_WATCH),
+                };
+            }
+            KeyCode::Char('r') if self.stream.is_none() => return ViewerAction::Rerun,
+            _ => {}
+        }
+        ViewerAction::None
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        self.scroll = (self.scroll as isize + delta).clamp(0, self.max_scroll() as isize) as usize;
+        if delta < 0 {
+            self.follow = false;
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.lines.len().saturating_sub(self.height.max(1))
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.height = area.height.saturating_sub(2) as usize;
+        if self.follow {
+            self.scroll = self.max_scroll();
+        }
+
+        let mut badges = Vec::new();
+        if let Some(interval) = self.watch {
+            badges.push(Span::styled(format!(" watch {}s ", interval.as_secs()), theme.badge(theme.success)));
+        }
+        if self.stream.is_some() && !self.stream_ended {
+            let label = if self.follow { " live · follow " } else { " live · paused " };
+            badges.push(Span::styled(label, theme.badge(theme.secondary)));
+        }
+        if self.loading {
+            badges.push(Span::styled(" running… ", theme.badge(theme.warning)));
+        }
+        let position = format!(" {}/{} ", (self.scroll + self.height).min(self.lines.len()), self.lines.len());
+
+        let mut title = vec![Span::raw(" "), Span::styled(self.title.clone(), Style::new().bold()), Span::raw(" ")];
+        title.extend(badges);
+
+        let block = theme
+            .block()
+            .border_style(theme.fg(theme.secondary))
+            .title(Line::from(title))
+            .title(Line::from(position).right_aligned())
+            .title_bottom(Line::from(format!(" $ {} ", helpers::shell_join(&self.argv))).dim())
+            .title_bottom(
+                Line::from(" q close · j/k ↑↓ · space/u page · g/G · h/l ←→ · w watch · r rerun · f follow ")
+                    .right_aligned()
+                    .dim(),
+            );
+
+        let style = if self.is_error { theme.fg(theme.danger) } else { Style::new() };
+        let visible: Vec<Line> = self
+            .lines
+            .iter()
+            .skip(self.scroll)
+            .take(self.height)
+            .map(|l| Line::styled(l.as_str(), style))
+            .collect();
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(visible).style(theme.base()).block(block).scroll((0, self.hscroll)), area);
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        if let Some(child) = self.stream.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}

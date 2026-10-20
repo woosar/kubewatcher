@@ -1,0 +1,10 @@
+[package]
+name = "kubewatcher"
+version = "0.1.0"
+edition = "2024"
+description = "A TUI for kubectl contexts, resources and helm releases, with a built-in cheatsheet"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ratatui = "0.30"
+serde_json = "1"
