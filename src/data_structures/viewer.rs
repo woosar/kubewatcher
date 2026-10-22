@@ -203,3 +203,91 @@ impl Drop for Viewer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    use super::*;
+
+    fn press(viewer: &mut Viewer, code: KeyCode) -> ViewerAction {
+        viewer.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn draw(viewer: &mut Viewer) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal.draw(|frame| viewer.render(frame, frame.area(), &Theme::default())).unwrap();
+        terminal.backend().to_string()
+    }
+
+    fn sleeper() -> Child {
+        Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap()
+    }
+
+    #[test]
+    fn captured_output_scrolls_and_watches() {
+        let mut viewer = Viewer::new("describe pod/web".into(), helpers::argv(&["kubectl", "describe", "pod", "web"]), 1);
+        viewer.mark_running();
+        assert!(draw(&mut viewer).contains("running…"));
+        viewer.set_output(Ok((1..=30).map(|i| format!("line {i}\n")).collect()));
+        assert!(draw(&mut viewer).contains("line 1 "));
+
+        assert!(matches!(press(&mut viewer, KeyCode::Char('j')), ViewerAction::None));
+        press(&mut viewer, KeyCode::Char(' '));
+        press(&mut viewer, KeyCode::Char('k'));
+        press(&mut viewer, KeyCode::Char('u'));
+        press(&mut viewer, KeyCode::Char('G'));
+        assert!(draw(&mut viewer).contains("30/30"));
+        press(&mut viewer, KeyCode::Char('g'));
+        press(&mut viewer, KeyCode::Char('l'));
+        press(&mut viewer, KeyCode::Char('h'));
+        press(&mut viewer, KeyCode::Char('f'));
+        press(&mut viewer, KeyCode::Char('x'));
+
+        assert!(!viewer.watch_due());
+        press(&mut viewer, KeyCode::Char('w'));
+        assert!(draw(&mut viewer).contains("watch 2s"));
+        viewer.watch = Some(Duration::ZERO);
+        assert!(viewer.watch_due());
+        press(&mut viewer, KeyCode::Char('w'));
+        assert!(viewer.watch.is_none());
+        assert!(matches!(press(&mut viewer, KeyCode::Char('r')), ViewerAction::Rerun));
+        assert!(matches!(press(&mut viewer, KeyCode::Esc), ViewerAction::Close));
+    }
+
+    #[test]
+    fn errors_and_empty_output_are_shown() {
+        let mut viewer = Viewer::new("yaml".into(), Vec::new(), 1);
+        viewer.set_output(Ok(String::new()));
+        assert!(draw(&mut viewer).contains("(no output)"));
+        viewer.set_output(Err("Error from server (NotFound)".into()));
+        assert!(viewer.is_error && draw(&mut viewer).contains("NotFound"));
+    }
+
+    #[test]
+    fn streams_follow_pause_and_stay_bounded() {
+        let mut viewer = Viewer::new("logs".into(), helpers::argv(&["kubectl", "logs", "-f", "web"]), 2);
+        viewer.attach_stream(sleeper());
+        for i in 0..=MAX_LINES {
+            viewer.push_line(&format!("log {i}"));
+        }
+        assert_eq!(viewer.lines.len(), MAX_LINES);
+        assert!(draw(&mut viewer).contains("live · follow"));
+        press(&mut viewer, KeyCode::Char('f'));
+        assert!(draw(&mut viewer).contains("live · paused"));
+        press(&mut viewer, KeyCode::Char('f'));
+        press(&mut viewer, KeyCode::Up);
+        assert!(!viewer.follow);
+        press(&mut viewer, KeyCode::End);
+        assert!(viewer.follow);
+        assert!(matches!(press(&mut viewer, KeyCode::Char('r')), ViewerAction::None));
+        press(&mut viewer, KeyCode::Char('w'));
+        assert!(viewer.watch.is_none());
+        viewer.end_stream();
+        assert_eq!(viewer.lines.last().map(String::as_str), Some("── stream ended ──"));
+        // Dropping the viewer kills the still-running process.
+    }
+}

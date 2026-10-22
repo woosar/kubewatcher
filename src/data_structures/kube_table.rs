@@ -226,5 +226,56 @@ CURRENT   NAME        CLUSTER     AUTHINFO    NAMESPACE
         let table = KubeTable::from_helm_json(json).unwrap();
         assert_eq!(table.cell(&table.rows[0], "UPDATED"), Some("2024-05-01 10:11:12"));
         assert_eq!(table.cell(&table.rows[0], "REVISION"), Some("3"));
+
+        let mixed = KubeTable::from_helm_json(r#"[{"name":"db","revision":7,"app_version":null}]"#).unwrap();
+        assert_eq!(mixed.cell(&mixed.rows[0], "REVISION"), Some("7"));
+        assert_eq!(mixed.cell(&mixed.rows[0], "APP VERSION"), None);
+        assert!(KubeTable::from_helm_json("Error: not json").is_err_and(|e| e.starts_with("unexpected helm output")));
+    }
+
+    #[test]
+    fn empty_output_and_filtering() {
+        let empty = KubeTable::parse("\n  \n");
+        assert!(empty.headers.is_empty() && empty.rows.is_empty());
+
+        let table = KubeTable::parse("NAME   STATUS\nweb    Running\ndb     Pending\n");
+        assert_eq!(table.visible_rows("pend"), [1]);
+        assert_eq!(table.visible_rows(""), [0, 1]);
+        assert_eq!(table.column("MISSING"), None);
+    }
+
+    #[test]
+    fn colors_well_known_states() {
+        let theme = Theme::default();
+        let danger = theme.fg(theme.danger).add_modifier(Modifier::BOLD);
+        assert_eq!(KubeTable::cell_style(&theme, "READY", "True"), theme.fg(theme.success));
+        assert_eq!(KubeTable::cell_style(&theme, "READY", "False"), danger);
+        assert_eq!(KubeTable::cell_style(&theme, "READY", "Unknown"), theme.fg(theme.warning));
+        assert_eq!(KubeTable::cell_style(&theme, "READY", "1/1"), Style::new());
+        assert_eq!(
+            KubeTable::cell_style(&theme, "SUSPENDED", "True"),
+            theme.fg(theme.warning).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(KubeTable::cell_style(&theme, "STATUS", "CrashLoopBackOff"), danger);
+        assert_eq!(KubeTable::cell_style(&theme, "STATUS", "ContainerCreating"), theme.fg(theme.warning));
+        assert_eq!(KubeTable::cell_style(&theme, "STATUS", "deployed"), theme.fg(theme.success));
+        assert_eq!(KubeTable::cell_style(&theme, "STATUS", "Completed"), theme.fg(theme.muted));
+        assert_eq!(KubeTable::cell_style(&theme, "STATUS", "Whatever"), Style::new());
+    }
+
+    #[test]
+    fn renders_rows_with_styles() {
+        let table = KubeTable::parse("NAME   STATUS    READY\nweb    Running   True\ndb     Error     False\n");
+        let theme = Theme::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 6)).unwrap();
+        let mut state = TableState::default().with_selected(Some(0));
+        terminal
+            .draw(|frame| {
+                let highlight = |row: &[String]| (row[0] == "db").then(Style::new);
+                table.render(frame, frame.area(), &[0, 1], &mut state, theme.block(), &theme, highlight);
+            })
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("web") && screen.contains("Error"));
     }
 }

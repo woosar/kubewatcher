@@ -333,7 +333,97 @@ mod tests {
 
     #[test]
     fn expands_aliases() {
-        assert_eq!(helpers::expand_alias("ked web"), "kubectl edit deploy web");
+        assert_eq!(helpers::expand_alias("ked web"), "kubectl edit deployment web");
         assert_eq!(helpers::expand_alias("kubectl get pods"), "kubectl get pods");
+        assert_eq!(helpers::expand_alias("watch kgp"), "watch kubectl get pods");
+        assert_eq!(helpers::expand_alias("watch -n 5 kgp -A"), "watch -n 5 kubectl get pods -A");
+    }
+
+    #[test]
+    fn completes_pod_names_after_oh_my_zsh_aliases() {
+        let c = completer();
+        assert_eq!(c.complete("klf xxx").1, ["xxx-service-7d9f-abc"]);
+        assert_eq!(c.complete("kl xxx").1, ["xxx-service-7d9f-abc"]);
+        assert_eq!(c.complete("watch klf xxx").1, ["xxx-service-7d9f-abc"]);
+        assert!(c.complete("kl").1.contains(&"klf".to_string()));
+    }
+
+    fn has(candidates: &[String], word: &str) -> bool {
+        candidates.iter().any(|c| c == word)
+    }
+
+    #[test]
+    fn completes_every_kubectl_position() {
+        let mut c = completer();
+        c.contexts = vec!["prod".into(), "staging".into()];
+        c.set_resources("pod/web-1\ndeployment.apps/web\nnode/worker-1\n");
+
+        assert!(has(&c.complete("").1, "klf"));
+        assert!(has(&c.complete("kubectl ").1, "rollout"));
+        assert!(has(&c.complete("kubectl get pods --").1, "--show-labels"));
+        assert_eq!(c.complete("kubectl get pods --context ").1, ["prod", "staging"]);
+        assert!(has(&c.complete("kubectl get pods -o ").1, "yaml"));
+        assert!(c.complete("kubectl logs nope/x").1.is_empty());
+        assert!(has(&c.complete("kubectl config ").1, "use-context"));
+        assert_eq!(c.complete("kubectl config use-context ").1, ["prod", "staging"]);
+        assert!(c.complete("kubectl config view ").1.is_empty());
+        assert!(has(&c.complete("kubectl rollout ").1, "restart"));
+        assert_eq!(c.complete("kubectl rollout restart ").1, ["deployment/web"]);
+        assert!(c.complete("kubectl rollout restart deployment/web ").1.is_empty());
+        assert_eq!(c.complete("kubectl top ").1, ["pods", "nodes"]);
+        assert_eq!(c.complete("kubectl top nodes ").1, ["worker-1"]);
+        assert!(c.complete("kubectl top nonsense ").1.is_empty());
+        assert!(has(&c.complete("kubectl logs ").1, "svc/"));
+        assert_eq!(c.complete("kubectl drain ").1, ["worker-1"]);
+        assert_eq!(c.complete("kubectl get ns ").1, ["default", "shop"]);
+        assert_eq!(c.complete("kubectl get deployment.apps ").1, ["web"]);
+        assert!(has(&c.complete("kubectl get ").1, "all"));
+        assert!(c.complete("kubectl get nonsense ").1.is_empty());
+        assert!(c.complete("kubectl apply ").1.is_empty());
+        assert!(c.complete("ls ").1.is_empty());
+        assert!(has(&c.complete("watch -n 5 kubectl ").1, "get"));
+    }
+
+    #[test]
+    fn completes_helm_and_flux() {
+        let mut c = completer();
+        c.releases = vec!["web".into()];
+        c.flux_names = vec!["apps".into()];
+        assert_eq!(c.complete("helm status -n ").1, ["default", "shop"]);
+        assert!(has(&c.complete("helm upgrade --").1, "--atomic"));
+        assert!(has(&c.complete("helm ").1, "rollback"));
+        assert!(has(&c.complete("helm get ").1, "manifest"));
+        assert_eq!(c.complete("helm get values ").1, ["web"]);
+        assert!(has(&c.complete("helm repo ").1, "update"));
+        for verb in ["status", "history", "rollback", "uninstall", "upgrade", "diff"] {
+            assert_eq!(c.complete(&format!("helm {verb} ")).1, ["web"]);
+        }
+        assert!(c.complete("helm lint ./chart ").1.is_empty());
+        assert!(c.complete("helm get values web ").1.is_empty());
+        assert!(c.complete("helm repo add ").1.is_empty());
+        assert!(c.complete("helm status web ").1.is_empty());
+        assert_eq!(c.complete("helm status -n shop ").1, ["web"]);
+        assert!(has(&c.complete("flux ").1, "reconcile"));
+        assert!(has(&c.complete("flux reconcile ").1, "kustomization"));
+        assert!(has(&c.complete("flux reconcile source ").1, "git"));
+        assert_eq!(c.complete("flux suspend kustomization ").1, ["apps"]);
+    }
+
+    #[test]
+    fn tab_inserts_cycles_and_shows_suggestions() {
+        let mut c = completer();
+        let mut input = "kubectl zzz".to_string();
+        c.tab(&mut input, false);
+        assert_eq!(input, "kubectl zzz");
+
+        let mut input = "kubectl describe deploy ".to_string();
+        assert_eq!(c.suggestions(&input), (vec!["xxx-service".to_string(), "billing".to_string()], None));
+        c.tab(&mut input, true);
+        assert_eq!(input, "kubectl describe deploy billing");
+        assert_eq!(c.suggestions(&input).1, Some(1));
+        c.tab(&mut input, true);
+        assert_eq!(input, "kubectl describe deploy xxx-service");
+        c.reset();
+        assert_eq!(c.suggestions("kubectl describe deploy xxx-service").1, None);
     }
 }

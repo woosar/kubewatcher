@@ -2,7 +2,13 @@
 name = "kubewatcher"
 version = "0.1.0"
 edition = "2024"
-description = "A TUI for kubectl contexts, resources and helm releases, with a built-in cheatsheet"
+description = "A learn-by-doing TUI for kubectl, helm and flux that shows and logs every real command it runs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/woosar/kubewatcher"
+readme = "README.md"
+keywords = ["kubernetes", "kubectl", "helm", "flux", "tui"]
+categories = ["command-line-utilities"]
+exclude = [".idea/", "docs/"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

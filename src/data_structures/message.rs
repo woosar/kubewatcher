@@ -13,9 +13,12 @@ pub enum Target {
     Completions,
     /// A one-shot mutating action; the result goes to the status bar.
     Action,
+    /// A Tooling row's installed version, or with `latest` its newest release.
+    Tooling { row: usize, latest: bool },
 }
 
 /// Messages sent from background command threads to the UI loop.
+#[derive(Debug, PartialEq)]
 pub enum Msg {
     Output {
         target: Target,

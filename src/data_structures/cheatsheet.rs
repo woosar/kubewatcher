@@ -7,6 +7,7 @@ use ratatui::widgets::{Cell, Row, Table, TableState};
 use crate::data_structures::Theme;
 use crate::helpers;
 
+#[derive(Clone, Copy)]
 struct CheatEntry {
     section: &'static str,
     command: &'static str,
@@ -29,6 +30,10 @@ const ENTRIES: &[CheatEntry] = &[
     entry("context", "kubectl config view --minify", "Show config of the current context only"),
     entry("context", "KUBECONFIG=~/.kube/config:~/new.yaml kubectl config view --flatten > /tmp/merged.yaml", "Merge two kubeconfig files"),
     entry("context", "kubectl cluster-info", "API server and core service endpoints"),
+    entry("context", "kubectx", "List contexts; kubectx <context> switches (Tooling tab installs it)"),
+    entry("context", "kubens <ns>", "Switch the current context's default namespace"),
+    entry("context", "kubectl config view --context=<context> --minify --flatten --raw", "One context as a self-contained kubeconfig (what S writes to config.d)"),
+    entry("context", "kubectl config view --kubeconfig=<file> -o json", "Which contexts one kubeconfig file defines (the FILE column)"),
     entry("context", "kubectl auth can-i --list -n <ns>", "What am I allowed to do here?"),
     // inspect
     entry("inspect", "kubectl get all -n <ns>", "Common workload resources in a namespace"),
@@ -154,9 +159,13 @@ impl Cheatsheet {
         }
     }
 
-    fn visible(&self) -> Vec<&'static CheatEntry> {
+    /// The cheatsheet entries followed by every prompt alias (alias -> what it expands to).
+    fn visible(&self) -> Vec<CheatEntry> {
+        let aliases = helpers::ALIASES.iter().map(|&(alias, expansion)| entry("alias", alias, expansion));
         ENTRIES
             .iter()
+            .copied()
+            .chain(aliases)
             .filter(|e| helpers::matches_filter([e.section, e.command, e.description], &self.filter))
             .collect()
     }
@@ -204,5 +213,32 @@ impl Cheatsheet {
             .row_highlight_style(theme.selected())
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(table, area, &mut self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    fn draw(cheatsheet: &mut Cheatsheet) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal.draw(|frame| cheatsheet.render(frame, frame.area(), &Theme::default())).unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn filters_entries_and_aliases() {
+        let mut cheatsheet = Cheatsheet::new();
+        assert_eq!(cheatsheet.selected_command(), Some("kubectl config get-contexts"));
+        assert!(draw(&mut cheatsheet).contains(&format!("Cheatsheet ({})", ENTRIES.len() + helpers::ALIASES.len())));
+        cheatsheet.step(1);
+        assert_eq!(cheatsheet.selected_command(), Some("kubectl config current-context"));
+
+        cheatsheet.filter = "logs -f --since=1h".into();
+        cheatsheet.clamp();
+        assert_eq!(cheatsheet.selected_command(), Some("klf1h"));
+        assert!(draw(&mut cheatsheet).contains("/logs -f --since=1h"));
     }
 }

@@ -91,12 +91,10 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Logs go to `$XDG_STATE_HOME/kubewatcher/journal/YYYY-MM-DD.log`
-    /// (default `~/.local/state/kubewatcher/journal/`), one file per day.
-    pub fn open() -> Self {
-        let dir = helpers::xdg_dir("XDG_STATE_HOME", &[".local", "state"])
-            .map(|dir| dir.join("kubewatcher").join("journal"))
-            .filter(|dir| fs::create_dir_all(dir).is_ok());
+    /// Logs go to `<dir>/YYYY-MM-DD.log`, one file per day; normally `dir` is
+    /// `$XDG_STATE_HOME/kubewatcher/journal/` (default `~/.local/state/kubewatcher/journal/`).
+    pub fn open(dir: Option<PathBuf>) -> Self {
+        let dir = dir.filter(|dir| fs::create_dir_all(dir).is_ok());
         Self {
             entries: Vec::new(),
             next_id: 0,
@@ -425,5 +423,116 @@ mod tests {
         assert!(!outcome.ok);
         assert_eq!(outcome.summary, "Error from server (NotFound): pods \"x\" not found");
         assert!(j.entries[0].change);
+        j.finish(999, true, "unknown ids are ignored");
+    }
+
+    #[test]
+    fn classifies_helm_and_flux_changes() {
+        assert!(Journal::is_change("helm repo add bitnami https://charts.bitnami.com"));
+        assert!(!Journal::is_change("helm repo update"));
+        assert!(!Journal::is_change("helm template web ./chart"));
+        assert!(!Journal::is_change("ls -la"));
+        assert!(!Journal::is_change(""));
+    }
+
+    #[test]
+    fn writes_one_log_file_per_day() {
+        let dir = helpers::test_dir("journal");
+        let mut j = Journal::open(Some(dir.clone()));
+        let id = j.record(&helpers::argv(&["kubectl", "get", "pods"]), "you", RunMode::Capture, false);
+        j.finish(id, true, "");
+        let auto = j.record(&helpers::argv(&["kubectl", "get", "pods"]), "watch", RunMode::Capture, true);
+        j.finish(auto, true, "not logged");
+        j.append("2000-01-01".into(), "first");
+        j.append("2000-01-01".into(), "second");
+        j.append("2000-01-02".into(), "next day");
+
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let log = fs::read_to_string(dir.join(format!("{today}.log"))).unwrap();
+        assert!(log.contains("$ kubectl get pods") && log.contains("(no output)"), "{log}");
+        assert!(!log.contains("not logged"));
+        assert_eq!(fs::read_to_string(dir.join("2000-01-01.log")).unwrap(), "first\nsecond\n");
+        assert_eq!(fs::read_to_string(dir.join("2000-01-02.log")).unwrap(), "next day\n");
+        drop(j);
+        fs::remove_dir_all(&dir).unwrap();
+
+        // A "directory" that is really a file: the journal still works, in memory only.
+        let file = helpers::test_dir("journal-file");
+        fs::write(&file, "").unwrap();
+        let mut j = Journal::open(Some(file.join("journal")));
+        assert!(j.dir.is_none());
+        j.append("2000-01-01".into(), "dropped");
+        fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn keeps_a_bounded_history() {
+        let mut j = journal();
+        let argv = helpers::argv(&["kubectl", "get", "pods"]);
+        for _ in 0..=MAX_ENTRIES {
+            j.record(&argv, "you", RunMode::Capture, false);
+        }
+        assert_eq!(j.entries.len(), MAX_ENTRIES);
+        assert_eq!(j.entries[0].id, 2);
+    }
+
+    #[test]
+    fn labels_every_kind_of_run() {
+        let mut j = journal();
+        for (mode, label) in [
+            (RunMode::Capture, "read"),
+            (RunMode::Stream, "stream"),
+            (RunMode::Interactive, "shell"),
+            (RunMode::Background, "bg"),
+        ] {
+            let id = j.record(&helpers::argv(&["kubectl", "logs", "web"]), "you", mode, false);
+            assert_eq!(j.entries[id as usize - 1].kind_label(), label);
+        }
+        j.record(&helpers::argv(&["kubectl", "delete", "pod", "web"]), "you", RunMode::Capture, false);
+        assert_eq!(j.entries.last().unwrap().kind_label(), "CHANGE");
+    }
+
+    #[test]
+    fn filters_selects_and_renders() {
+        let mut j = journal();
+        let get = helpers::argv(&["kubectl", "get", "pods"]);
+        let first = j.record(&get, "watch", RunMode::Capture, true);
+        j.finish(first, true, "NAME");
+        let again = j.record(&get, "watch", RunMode::Capture, true);
+        j.finish(again, true, "NAME");
+        let delete = j.record(&helpers::argv(&["kubectl", "delete", "pod", "web"]), "Resources ▸ delete", RunMode::Capture, false);
+        j.finish(delete, false, "forbidden");
+        j.record(&helpers::argv(&["kubectl", "logs", "-f", "web"]), "Resources ▸ logs", RunMode::Stream, false);
+
+        let theme = Theme::default();
+        let draw = |j: &mut Journal| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 14)).unwrap();
+            terminal
+                .draw(|frame| {
+                    j.render(frame, Rect::new(0, 0, 140, 6), &theme);
+                    j.render_strip(frame, Rect::new(0, 6, 140, 8), &theme);
+                })
+                .unwrap();
+            terminal.backend().to_string()
+        };
+        let screen = draw(&mut j);
+        assert!(screen.contains("×2") && screen.contains("forbidden") && screen.contains("not saved to disk"), "{screen}");
+        assert_eq!(j.selected_command().as_deref(), Some("kubectl logs -f web"));
+
+        j.step(-1);
+        assert_eq!(j.selected_command().as_deref(), Some("kubectl delete pod web"));
+        j.changes_only = true;
+        j.hide_auto = true;
+        j.filter = "web".into();
+        j.clamp();
+        let screen = draw(&mut j);
+        assert!(screen.contains("changes only, auto hidden") && screen.contains("/web"), "{screen}");
+        j.filter = "nothing matches".into();
+        j.clamp();
+        assert_eq!(j.selected_command(), None);
+        j.step(1);
+
+        j.dir = Some(std::path::PathBuf::from("logs"));
+        assert!(draw(&mut j).contains("saved to logs"));
     }
 }

@@ -1,11 +1,10 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Block;
 
-use crate::helpers;
 
 /// Built-in themes, written to the themes directory on first start so they can be edited.
 const BUILTIN: &[(&str, &str)] = &[
@@ -183,18 +182,14 @@ impl Theme {
 
     // ── loading ───────────────────────────────────────────────────────────
 
-    fn config_dir() -> Option<PathBuf> {
-        helpers::xdg_dir("XDG_CONFIG_HOME", &[".config"]).map(|dir| dir.join("kubewatcher"))
-    }
-
-    /// Loads every theme in `~/.config/kubewatcher/themes`, writing the built-in
-    /// ones there first if missing. Returns the themes, the index of the one
-    /// chosen in `config.toml`, and any problems found in the files.
-    pub fn load_all() -> (Vec<Theme>, usize, Vec<String>) {
+    /// Loads every theme in `<config_dir>/themes` (normally `~/.config/kubewatcher/themes`),
+    /// writing the built-in ones there first if missing. Returns the themes, the index
+    /// of the one chosen in `config.toml`, and any problems found in the files.
+    pub fn load_all(config_dir: Option<&Path>) -> (Vec<Theme>, usize, Vec<String>) {
         let mut problems = Vec::new();
         let mut themes = Vec::new();
 
-        if let Some(dir) = Self::config_dir().map(|d| d.join("themes")) {
+        if let Some(dir) = config_dir.map(|d| d.join("themes")) {
             if fs::create_dir_all(&dir).is_ok() {
                 for (name, content) in BUILTIN {
                     let path = dir.join(format!("{name}.toml"));
@@ -227,7 +222,7 @@ impl Theme {
         // Default first, the rest alphabetically.
         themes.sort_by_key(|t| (t.name != DEFAULT_NAME, t.name.clone()));
 
-        let chosen = Self::config_dir()
+        let chosen = config_dir
             .and_then(|dir| fs::read_to_string(dir.join("config.toml")).ok())
             .and_then(|text| Self::pairs(&text).find(|(k, _)| *k == "theme").map(|(_, v)| v.to_string()));
         let index = match chosen {
@@ -240,9 +235,9 @@ impl Theme {
         (themes, index, problems)
     }
 
-    /// Remembers the chosen theme in `~/.config/kubewatcher/config.toml`.
-    pub fn save_choice(name: &str) -> Result<PathBuf, String> {
-        let dir = Self::config_dir().ok_or("no home directory")?;
+    /// Remembers the chosen theme in `<config_dir>/config.toml`.
+    pub fn save_choice(config_dir: Option<&Path>, name: &str) -> Result<PathBuf, String> {
+        let dir = config_dir.ok_or("no home directory")?;
         let path = dir.join("config.toml");
         let existing = fs::read_to_string(&path).unwrap_or_default();
         let mut lines: Vec<String> = existing
@@ -254,7 +249,7 @@ impl Theme {
             lines.push("# kubewatcher settings".into());
         }
         lines.push(format!("theme = \"{name}\""));
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
         Ok(path)
     }
@@ -345,5 +340,73 @@ mod tests {
         assert_eq!(theme.accent, Color::Rgb(255, 0, 0));
         assert_eq!(theme.border, Color::Reset);
         assert_eq!(problems.len(), 2);
+
+        let (theme, problems) = Theme::parse("loose", "no equals sign\naccent = cyan  # unquoted\ntext = \"#00ff00\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(theme.accent, Color::Cyan);
+        assert_eq!(theme.text, Color::Rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn style_helpers_use_the_theme_colors() {
+        let mut theme = Theme::default();
+        assert_eq!(theme.base(), Style::new().bg(Color::Reset).fg(Color::Reset));
+        assert_eq!(theme.popup(), Style::new().bg(theme.surface).fg(theme.text));
+        assert_eq!(theme.border(), Style::new().fg(theme.border));
+        assert_eq!(theme.block(), Block::bordered().border_style(theme.border()));
+        assert_eq!(theme.header(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        assert_eq!(theme.chip(), Style::new().bg(theme.chip).fg(theme.on_chip));
+        assert_eq!(theme.badge(Color::Red), Style::new().bg(Color::Red).fg(theme.on_accent));
+        assert_eq!(theme.selected(), Style::new().add_modifier(Modifier::REVERSED));
+        theme.selection = Some(Color::Blue);
+        assert_eq!(theme.selected(), Style::new().bg(Color::Blue).fg(theme.on_selection).add_modifier(Modifier::BOLD));
+    }
+
+    #[test]
+    fn loads_seeds_and_remembers_themes() {
+        let dir = crate::helpers::test_dir("themes");
+        let (themes, index, problems) = Theme::load_all(Some(&dir));
+        let names: Vec<&str> = themes.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["default", "osaka-jade", "violet"]);
+        assert_eq!(index, 0);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        // A broken theme file, an unreadable one and a remembered choice.
+        fs::write(dir.join("themes").join("mine.toml"), "accent = \"nope\"\n").unwrap();
+        fs::create_dir_all(dir.join("themes").join("unreadable.toml")).unwrap();
+        let saved = Theme::save_choice(Some(&dir), "violet").unwrap();
+        assert_eq!(saved, dir.join("config.toml"));
+        Theme::save_choice(Some(&dir), "violet").unwrap();
+        assert_eq!(fs::read_to_string(&saved).unwrap(), "# kubewatcher settings\ntheme = \"violet\"\n");
+        let (themes, index, problems) = Theme::load_all(Some(&dir));
+        assert_eq!(themes[index].name, "violet");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+
+        Theme::save_choice(Some(&dir), "gone").unwrap();
+        let (_, index, problems) = Theme::load_all(Some(&dir));
+        assert_eq!(index, 0);
+        assert!(problems.iter().any(|p| p.contains("\"gone\" not found")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_builtins_without_a_usable_directory() {
+        let (themes, index, _) = Theme::load_all(None);
+        assert_eq!((themes.len(), index), (3, 0));
+        assert_eq!(Theme::save_choice(None, "violet"), Err("no home directory".into()));
+
+        // The config "directory" is a file, so nothing can be created in it.
+        let file = crate::helpers::test_dir("themes-file");
+        fs::write(&file, "").unwrap();
+        let (themes, _, _) = Theme::load_all(Some(&file));
+        assert_eq!(themes.len(), 3);
+        assert!(Theme::save_choice(Some(&file), "violet").is_err());
+        fs::remove_file(&file).unwrap();
+
+        // config.toml is a directory, so it cannot be written.
+        let dir = crate::helpers::test_dir("themes-config-dir");
+        fs::create_dir_all(dir.join("config.toml")).unwrap();
+        assert!(Theme::save_choice(Some(&dir), "violet").is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
