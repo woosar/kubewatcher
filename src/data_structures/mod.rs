@@ -16,7 +16,7 @@ mod viewer;
 pub use app::App;
 pub use cheatsheet::Cheatsheet;
 pub use completer::{COMPLETION_KINDS, Completer};
-pub use context_form::{ContextForm, FormAction, TOKEN_MASK};
+pub use context_form::{ContextForm, FormAction};
 #[cfg(not(test))]
 pub use host::SystemHost;
 pub use host::Host;

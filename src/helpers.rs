@@ -435,6 +435,25 @@ pub fn server_url(server: &str) -> String {
     }
 }
 
+/// The `kubectl config` commands that write a context of `name` into `file`: cluster
+/// (TLS not verified, there is no CA to pin), user with client certificate + key, context.
+pub fn context_commands(file: &Path, name: &str, server: &str, namespace: &str, certificate: &str, key: &str) -> [Vec<String>; 4] {
+    let kubeconfig = format!("--kubeconfig={}", file.display());
+    let config = |args: &[&str]| {
+        let mut argv = argv(&["kubectl", "config"]);
+        argv.extend(args.iter().map(|a| a.to_string()));
+        argv.push(kubeconfig.clone());
+        argv
+    };
+    [
+        config(&["set-cluster", name, &format!("--server={server}"), "--insecure-skip-tls-verify=true"]),
+        // `config set` base64-decodes the value and stores the bytes, which come out as the same base64 again.
+        config(&["set", &format!("users.{name}.client-certificate-data"), certificate]),
+        config(&["set", &format!("users.{name}.client-key-data"), key]),
+        config(&["set-context", name, &format!("--cluster={name}"), &format!("--user={name}"), &format!("--namespace={namespace}")]),
+    ]
+}
+
 /// A file name for a context: anything but letters, digits, `.`, `_` and `-` becomes `-`.
 pub fn context_file_name(name: &str) -> String {
     let safe: String = name

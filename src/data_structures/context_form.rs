@@ -7,21 +7,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::data_structures::Theme;
-use crate::helpers::{self, argv};
+use crate::helpers;
 
-const LABELS: [&str; 6] = ["Name", "Server", "Namespace", "Token", "Cert data", "Key data"];
-const HINTS: [&str; 6] = [
-    "unique across all kubeconfig files, e.g. homelab",
-    "IP, host or URL; 192.168.1.20 → https://192.168.1.20:6443",
+const LABELS: [&str; 5] = ["Name", "Server", "Namespace", "Cert data", "Key data"];
+const HINTS: [&str; 5] = [
+    "unique across all kubeconfig files, e.g. teststand1",
+    "IP, host or URL; 10.5.15.183 → https://10.5.15.183:6443",
     "empty means default",
-    "bearer token (service account / kubeadm), or leave empty and use cert + key",
-    "client-certificate-data (base64, as in k3s.yaml)",
-    "client-key-data (base64, as in k3s.yaml)",
+    "client-certificate-data (base64, one line)",
+    "client-key-data (base64, one line)",
 ];
-/// The secret fields: token, client certificate, client key.
-const SECRETS: [usize; 3] = [3, 4, 5];
-/// Shown instead of the token in the journal and the status bar.
-pub const TOKEN_MASK: &str = "--token=••••";
+/// The secret fields: client certificate and client key.
+const SECRETS: [usize; 2] = [3, 4];
 
 /// What the form wants after a key press.
 #[derive(Debug, PartialEq)]
@@ -32,11 +29,10 @@ pub enum FormAction {
 }
 
 /// The "add context" popup: what a kubeconfig entry needs, written as a cluster, a user
-/// and a context of the same name into a kubeconfig file of its own. The user signs in
-/// with a token or with a client certificate and key.
+/// (client certificate + key) and a context of the same name into a kubeconfig file of its own.
 #[derive(Default)]
 pub struct ContextForm {
-    fields: [String; 6],
+    fields: [String; 5],
     focus: usize,
 }
 
@@ -60,13 +56,12 @@ impl ContextForm {
 
     /// The `kubectl config` commands that write the entry into `file`, or what is wrong.
     /// There is no CA to pin, so the cluster is added with TLS verification off.
-    pub fn commands(&self, file: &Path) -> Result<Vec<Vec<String>>, String> {
-        let [name, server, namespace, token, certificate, key] = self.fields.each_ref().map(|f| f.trim());
-        let valid_name = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c));
-        if !valid_name(name) {
-            return Err(format!("name '{name}': use letters, digits and - _ . @ only"));
+    pub fn commands(&self, file: &Path) -> Result<[Vec<String>; 4], String> {
+        let [name, server, namespace, certificate, key] = self.fields.each_ref().map(|f| f.trim());
+        // The name becomes part of `users.<name>.…`, where a dot would split the path.
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_@".contains(c)) {
+            return Err(format!("name '{name}': use letters, digits and - _ @ only"));
         }
-        let with_certificate = !certificate.is_empty() || !key.is_empty();
         if server.is_empty() || server.contains(char::is_whitespace) {
             return Err("server: enter the API server's IP, host or URL".into());
         }
@@ -74,41 +69,13 @@ impl ContextForm {
         if !namespace.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
             return Err(format!("namespace '{namespace}': lowercase letters, digits and - only"));
         }
-        if with_certificate {
-            if !token.is_empty() {
-                return Err("token: leave it empty when using cert + key data".into());
-            }
-            if certificate.is_empty() || key.is_empty() || certificate.contains(char::is_whitespace) || key.contains(char::is_whitespace) {
-                return Err("cert/key data: paste both, each as one base64 line".into());
-            }
-            // The name becomes part of `users.<name>.…`, where a dot would split the path.
-            if name.contains('.') {
-                return Err(format!("name '{name}': no dots when using cert + key data"));
-            }
-        } else if token.is_empty() || token.contains(char::is_whitespace) {
-            return Err("token: paste the bearer token (no spaces), or cert + key data".into());
+        if certificate.is_empty() || certificate.contains(char::is_whitespace) {
+            return Err("cert data: paste client-certificate-data as one base64 line".into());
         }
-        let kubeconfig = format!("--kubeconfig={}", file.display());
-        let config = |args: &[&str]| {
-            let mut argv = argv(&["kubectl", "config"]);
-            argv.extend(args.iter().map(|a| a.to_string()));
-            argv.push(kubeconfig.clone());
-            argv
-        };
-        let server = format!("--server={}", helpers::server_url(server));
-        let cluster = format!("--cluster={name}");
-        let user = format!("--user={name}");
-        let namespace = format!("--namespace={namespace}");
-        let mut commands = vec![config(&["set-cluster", name, &server, "--insecure-skip-tls-verify=true"])];
-        if with_certificate {
-            // `config set` base64-decodes the value and stores the bytes, which come out as the same base64 again.
-            commands.push(config(&["set", &format!("users.{name}.client-certificate-data"), certificate]));
-            commands.push(config(&["set", &format!("users.{name}.client-key-data"), key]));
-        } else {
-            commands.push(config(&["set-credentials", name, &format!("--token={token}")]));
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err("key data: paste client-key-data as one base64 line".into());
         }
-        commands.push(config(&["set-context", name, &cluster, &user, &namespace]));
-        Ok(commands)
+        Ok(helpers::context_commands(file, name, &helpers::server_url(server), namespace, certificate, key))
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, file: &str, theme: &Theme) {
@@ -126,7 +93,7 @@ impl ContextForm {
         }
         text.push(Line::from(""));
         text.push(Line::styled(format!(" saved to {file} (TLS not verified)"), theme.fg(theme.muted)));
-        text.push(Line::styled(" Tab/↑↓ field · Enter next / save on Key data · Esc cancel", theme.fg(theme.muted)));
+        text.push(Line::styled(" Tab/↑↓ field · Enter next / save on Key data (or Token) · Esc cancel", theme.fg(theme.muted)));
 
         let height = text.len() as u16 + 2;
         let popup = area.centered(Constraint::Length(76.min(area.width)), Constraint::Length(height.min(area.height)));
@@ -142,7 +109,7 @@ mod tests {
 
     use super::*;
 
-    fn type_in(form: &mut ContextForm, fields: [&str; 6]) {
+    fn type_in(form: &mut ContextForm, fields: [&str; 5]) {
         for value in fields {
             for c in value.chars() {
                 form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -164,51 +131,36 @@ mod tests {
     }
 
     #[test]
-    fn commands_write_cluster_user_and_context() {
+    fn commands_write_cluster_client_certificate_key_and_context() {
         let mut form = ContextForm::default();
-        type_in(&mut form, [" homelab ", "192.168.1.20", "", "abc.def", "", ""]);
-        assert_eq!(form.name(), "homelab");
-        let commands: Vec<String> = form.commands(Path::new("/h/.kube/config.d/kubewatcher.yaml")).unwrap().iter().map(|c| helpers::shell_join(c)).collect();
-        let file = "--kubeconfig=/h/.kube/config.d/kubewatcher.yaml";
+        type_in(&mut form, [" teststand1 ", "10.5.15.183", "", "Q0VSVA==", "S0VZ"]);
+        assert_eq!(form.name(), "teststand1");
+        let commands = form.commands(Path::new("/h/.kube/config.d/teststand1.yaml")).unwrap().map(|c| helpers::shell_join(&c));
+        let file = "--kubeconfig=/h/.kube/config.d/teststand1.yaml";
         assert_eq!(
             commands,
             [
-                format!("kubectl config set-cluster homelab --server=https://192.168.1.20:6443 --insecure-skip-tls-verify=true {file}"),
-                format!("kubectl config set-credentials homelab --token=abc.def {file}"),
-                format!("kubectl config set-context homelab --cluster=homelab --user=homelab --namespace=default {file}"),
+                format!("kubectl config set-cluster teststand1 --server=https://10.5.15.183:6443 --insecure-skip-tls-verify=true {file}"),
+                format!("kubectl config set users.teststand1.client-certificate-data Q0VSVA== {file}"),
+                format!("kubectl config set users.teststand1.client-key-data S0VZ {file}"),
+                format!("kubectl config set-context teststand1 --cluster=teststand1 --user=teststand1 --namespace=default {file}"),
             ]
         );
-    }
-
-    #[test]
-    fn commands_can_use_client_certificate_and_key_instead_of_a_token() {
-        let mut form = ContextForm::default();
-        type_in(&mut form, ["teststand1", "10.5.15.183", "", "", "Q0VSVA==", "S0VZ"]);
-        let commands: Vec<String> = form.commands(Path::new("/h/t.yaml")).unwrap().iter().map(|c| helpers::shell_join(c)).collect();
-        assert_eq!(
-            commands[1..3],
-            [
-                "kubectl config set users.teststand1.client-certificate-data Q0VSVA== --kubeconfig=/h/t.yaml",
-                "kubectl config set users.teststand1.client-key-data S0VZ --kubeconfig=/h/t.yaml",
-            ]
-        );
-        assert_eq!(commands.len(), 4);
     }
 
     #[test]
     fn commands_reject_bad_input() {
-        let check = |fields: [&str; 6]| {
+        let check = |fields: [&str; 5]| {
             let mut form = ContextForm::default();
             type_in(&mut form, fields);
             form.commands(Path::new("f")).unwrap_err()
         };
-        assert!(check(["", "h", "", "t", "", ""]).starts_with("name"));
-        assert!(check(["a b", "h", "", "t", "", ""]).starts_with("name"));
-        assert!(check(["a", "", "", "t", "", ""]).starts_with("server"));
-        assert!(check(["a", "h", "Prod", "t", "", ""]).starts_with("namespace"));
-        assert!(check(["a", "h", "", "", "", ""]).starts_with("token"));
-        assert!(check(["a", "h", "", "t", "c", "k"]).starts_with("token"));
-        assert!(check(["a", "h", "", "", "c", ""]).starts_with("cert/key"));
-        assert!(check(["a.b", "h", "", "", "c", "k"]).starts_with("name"));
+        assert!(check(["", "h", "", "c", "k"]).starts_with("name"));
+        assert!(check(["a b", "h", "", "c", "k"]).starts_with("name"));
+        assert!(check(["a.b", "h", "", "c", "k"]).starts_with("name"));
+        assert!(check(["a", "", "", "c", "k"]).starts_with("server"));
+        assert!(check(["a", "h", "Prod", "c", "k"]).starts_with("namespace"));
+        assert!(check(["a", "h", "", "", "k"]).starts_with("cert data"));
+        assert!(check(["a", "h", "", "c", ""]).starts_with("key data"));
     }
 }

@@ -16,7 +16,7 @@ use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
 use crate::data_structures::{
-    COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, FormAction, Host, Journal, K3sForm, KubeTable, Machine, Msg, RunMode, TOKEN_MASK, Target,
+    COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, FormAction, Host, Journal, K3sForm, KubeTable, Machine, Msg, RunMode, Target,
     Theme, Tool, ToolKind, Viewer, ViewerAction,
 };
 use crate::helpers::{self, argv};
@@ -1265,17 +1265,11 @@ impl App {
     }
 
     /// Runs the `kubectl config` writes; the journal and status bar only ever see masked
-    /// secrets: the token and every value set for a `…-data` property.
+    /// secrets: every value set for a `…-data` property (client certificate and key).
     fn save_context(&mut self, name: &str, commands: &[Vec<String>]) {
         let join = |mask: bool| {
             let mask_secret = |(i, arg): (usize, &String), argv: &[String]| {
-                if mask && arg.starts_with("--token=") {
-                    TOKEN_MASK.to_string()
-                } else if mask && i > 0 && argv[i - 1].ends_with("-data") {
-                    "••••".to_string()
-                } else {
-                    arg.clone()
-                }
+                if mask && i > 0 && argv[i - 1].ends_with("-data") { "••••".to_string() } else { arg.clone() }
             };
             let render = |argv: &Vec<String>| helpers::shell_join(&argv.iter().enumerate().map(|a| mask_secret(a, argv)).collect::<Vec<_>>());
             commands.iter().map(render).collect::<Vec<_>>().join(" && ")
@@ -2402,8 +2396,8 @@ GLOBAL
   J              toggle command strip    P        manage port-forwards      q  quit
   T              next color theme (files in ~/.config/kubewatcher/themes/, choice in config.toml)
 CONTEXTS (1)
-  Enter use context   a add (name, server, namespace, token or cert + key data)   x remove (own file)
-  K import from k3s: name + IP → ssh -t <ip> sudo cat /etc/rancher/k3s/k3s.yaml, keeps cert + key
+  Enter use context   a add (name, server, namespace, client cert + key data)   x remove (own file)
+  K import from k3s: name, IP, user → ssh -t <user>@<ip> sudo cat /etc/rancher/k3s/k3s.yaml, keeps cert + key
   one file per context in ~/.kube/config.d · S splits files holding several (backup first)
 TOOLING (5)
   kubectl, kubectx/kubens, fzf, helm, flux into ~/.local/bin, kubeconfig layout, shell wiring
@@ -2773,17 +2767,19 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
 
         // A taken name is refused before any ssh.
         press(&mut app, KeyCode::Char('K'));
-        keys(&mut app, "prod");
-        press(&mut app, KeyCode::Enter);
-        keys(&mut app, "10.5.15.190");
-        press(&mut app, KeyCode::Enter);
+        for value in ["prod", "10.5.15.190", "additive"] {
+            keys(&mut app, value);
+            press(&mut app, KeyCode::Enter);
+        }
         assert!(status(&app).contains("already exists") && matches!(app.mode, Mode::ImportK3s(_)), "{}", status(&app));
         press(&mut app, KeyCode::Esc);
 
         press(&mut app, KeyCode::Char('K'));
-        keys(&mut app, "teststand3");
-        press(&mut app, KeyCode::Enter);
-        keys(&mut app, "additive@10.5.15.190");
+        for value in ["teststand3", "10.5.15.190"] {
+            keys(&mut app, value);
+            press(&mut app, KeyCode::Enter);
+        }
+        keys(&mut app, "additive");
         assert!(draw(&mut app).contains("ssh -t additive@10.5.15.190 sudo cat /etc/rancher/k3s/k3s.yaml"));
         press(&mut app, KeyCode::Enter);
         let mut job = app.pending_interactive.take().unwrap();
@@ -2829,7 +2825,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
 
         // Adding: a taken name is refused; a new one gets its own file.
         press(&mut app, KeyCode::Char('a'));
-        for value in ["prod", "10.0.0.5", "", "s3cret", "", ""] {
+        for value in ["prod", "10.0.0.5", "", "c3rt", "s3cret"] {
             keys(&mut app, value);
             press(&mut app, KeyCode::Tab);
         }
@@ -2840,7 +2836,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         press(&mut app, KeyCode::Char('a'));
         keys(&mut app, "lab");
         assert!(draw(&mut app).contains("~/.kube/config.d/lab.yaml"));
-        for value in ["", "10.0.0.5", "", "s3cret", "", ""] {
+        for value in ["", "10.0.0.5", "", "c3rt", "s3cret"] {
             keys(&mut app, value);
             press(&mut app, KeyCode::Enter);
         }
