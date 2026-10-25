@@ -56,7 +56,10 @@ pub fn set_child_env(name: &'static str, value: OsString) {
 /// A variable as the started commands see it.
 pub fn child_env(name: &str) -> Option<OsString> {
     let env = CHILD_ENV.read().unwrap_or_else(|e| e.into_inner());
-    env.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone()).or_else(|| std::env::var_os(name))
+    env.iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var_os(name))
 }
 
 /// The one way commands are built: argv plus the child environment. A changed PATH is
@@ -94,7 +97,11 @@ pub fn run_capture(argv: &[String]) -> Result<String, String> {
 pub fn spawn_capture(argv: Vec<String>, target: Target, journal: u64, tx: Sender<Msg>) {
     thread::spawn(move || {
         let result = run_capture(&argv);
-        let _ = tx.send(Msg::Output { target, journal, result });
+        let _ = tx.send(Msg::Output {
+            target,
+            journal,
+            result,
+        });
     });
 }
 
@@ -115,7 +122,12 @@ pub fn spawn_stream(argv: &[String], generation: u64, tx: &Sender<Msg>) -> io::R
     Ok(child)
 }
 
-fn forward_lines(reader: impl Read + Send + 'static, generation: u64, tx: Sender<Msg>, signal_end: bool) -> thread::JoinHandle<()> {
+fn forward_lines(
+    reader: impl Read + Send + 'static,
+    generation: u64,
+    tx: Sender<Msg>,
+    signal_end: bool,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
@@ -124,7 +136,9 @@ fn forward_lines(reader: impl Read + Send + 'static, generation: u64, tx: Sender
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let line = String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']).to_string();
+                    let line = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
                     if tx.send(Msg::Line { generation, line }).is_err() {
                         return;
                     }
@@ -227,7 +241,9 @@ pub fn matches_filter<'a>(cells: impl IntoIterator<Item = &'a str>, filter: &str
         return true;
     }
     let filter = filter.to_lowercase();
-    cells.into_iter().any(|cell| cell.to_lowercase().contains(&filter))
+    cells
+        .into_iter()
+        .any(|cell| cell.to_lowercase().contains(&filter))
 }
 
 /// Prompt aliases, following the oh-my-zsh kubectl/helm plugins so shell muscle memory works here too.
@@ -351,18 +367,28 @@ pub fn expand_alias(line: &str) -> String {
     };
     let prefix: String = words[..skip].iter().map(|w| format!("{w} ")).collect();
     let rest_line = words[skip..].join(" ");
-    let (first, rest) = rest_line.split_once(' ').unwrap_or((rest_line.as_str(), ""));
+    let (first, rest) = rest_line
+        .split_once(' ')
+        .unwrap_or((rest_line.as_str(), ""));
     match ALIASES.iter().find(|(alias, _)| *alias == first) {
-        Some((_, expansion)) if rest.is_empty() && !line.ends_with(' ') => format!("{prefix}{expansion}"),
+        Some((_, expansion)) if rest.is_empty() && !line.ends_with(' ') => {
+            format!("{prefix}{expansion}")
+        }
         Some((_, expansion)) => format!("{prefix}{expansion} {rest}"),
         None => line.to_string(),
     }
 }
 
 /// An XDG base directory: `$<env_var>` if set, otherwise `$HOME/<fallback...>`.
-pub fn xdg_dir(env_var: &str, fallback: &[&str]) -> Option<std::path::PathBuf> {
-    let from_env = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    from_env(env_var).or_else(|| from_env("HOME").map(|home| fallback.iter().fold(home, |dir, part| dir.join(part))))
+pub fn xdg_dir(env_var: &str, fallback: &[&str]) -> Option<PathBuf> {
+    let from_env = |var: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    from_env(env_var).or_else(|| {
+        from_env("HOME").map(|home| fallback.iter().fold(home, |dir, part| dir.join(part)))
+    })
 }
 
 /// `~/.kube/config` followed by every `~/.kube/config.d/*.yaml` in name order, like the
@@ -389,16 +415,35 @@ pub fn kubeconfig_files(home: &Path) -> Vec<PathBuf> {
 
 /// A file name for a context: anything but letters, digits, `.`, `_` and `-` becomes `-`.
 pub fn context_file_name(name: &str) -> String {
-    let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' }).collect();
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
     let safe = safe.trim_matches('.').to_string();
-    if safe.is_empty() { "context".into() } else { safe }
+    if safe.is_empty() {
+        "context".into()
+    } else {
+        safe
+    }
 }
 
 /// `<dir>/<context_file_name>.yaml`, with `-2`, `-3`… when that file already exists.
 pub fn context_file_path(dir: &Path, name: &str) -> PathBuf {
     let base = context_file_name(name);
     (1..)
-        .map(|n| dir.join(if n == 1 { format!("{base}.yaml") } else { format!("{base}-{n}.yaml") }))
+        .map(|n| {
+            dir.join(if n == 1 {
+                format!("{base}.yaml")
+            } else {
+                format!("{base}-{n}.yaml")
+            })
+        })
         .find(|path| !path.exists())
         .unwrap_or_else(|| dir.join(format!("{base}.yaml")))
 }
@@ -413,20 +458,25 @@ pub fn write_private(path: &Path, content: &str) -> io::Result<()> {
     let mut file = options.open(path)?;
     // `mode` only applies to new files.
     #[cfg(unix)]
-    file.set_permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600))?;
+    file.set_permissions(
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
     file.write_all(content.as_bytes())
 }
 
 /// The first executable called `name` on `search_path`.
 pub fn find_program(name: &str, search_path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(search_path).map(|dir| dir.join(name)).find(|path| is_executable(path))
+    std::env::split_paths(search_path)
+        .map(|dir| dir.join(name))
+        .find(|path| is_executable(path))
 }
 
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     path.is_file()
@@ -434,11 +484,17 @@ fn is_executable(path: &Path) -> bool {
 
 /// The first version number in a tool's output: `Client Version: v1.34.1` → `1.34.1`.
 pub fn first_version(text: &str) -> Option<String> {
-    text.split(|c: char| c.is_whitespace() || "(),:\"".contains(c)).find_map(|word| {
-        let digits: String = word.trim_start_matches('v').chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-        let digits = digits.trim_end_matches('.');
-        (digits.contains('.') && digits.starts_with(|c: char| c.is_ascii_digit())).then(|| digits.to_string())
-    })
+    text.split(|c: char| c.is_whitespace() || "(),:\"".contains(c))
+        .find_map(|word| {
+            let digits: String = word
+                .trim_start_matches('v')
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let digits = digits.trim_end_matches('.');
+            (digits.contains('.') && digits.starts_with(|c: char| c.is_ascii_digit()))
+                .then(|| digits.to_string())
+        })
 }
 
 /// `v1.2.3` and `1.2.3` are the same version.
@@ -448,7 +504,11 @@ pub fn same_version(a: &str, b: &str) -> bool {
 
 /// The single-line `plugins=(...)` of a .zshrc, if there is exactly one.
 fn omz_plugins_line(rc: &str) -> Option<(usize, &str)> {
-    let lines: Vec<(usize, &str)> = rc.lines().enumerate().filter(|(_, l)| l.trim_start().starts_with("plugins=(")).collect();
+    let lines: Vec<(usize, &str)> = rc
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with("plugins=("))
+        .collect();
     match lines[..] {
         [(index, line)] if line.trim_end().ends_with(')') => Some((index, line)),
         _ => None,
@@ -458,7 +518,13 @@ fn omz_plugins_line(rc: &str) -> Option<(usize, &str)> {
 pub fn omz_has_plugin(rc: &str, plugin: &str) -> bool {
     rc.lines()
         .filter(|l| l.trim_start().starts_with("plugins=("))
-        .any(|l| l.trim().trim_start_matches("plugins=(").trim_end_matches(')').split_whitespace().any(|p| p == plugin))
+        .any(|l| {
+            l.trim()
+                .trim_start_matches("plugins=(")
+                .trim_end_matches(')')
+                .split_whitespace()
+                .any(|p| p == plugin)
+        })
 }
 
 /// The rc with `plugin` added to oh-my-zsh's `plugins=(...)`, or None if it is already
@@ -469,9 +535,22 @@ pub fn add_omz_plugin(rc: &str, plugin: &str) -> Option<String> {
     }
     let (index, line) = omz_plugins_line(rc)?;
     let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-    let inner = line.trim().trim_start_matches("plugins=(").trim_end_matches(')').trim();
-    let new_line = if inner.is_empty() { format!("{indent}plugins=({plugin})") } else { format!("{indent}plugins=({inner} {plugin})") };
-    let text = rc.lines().enumerate().map(|(i, l)| if i == index { new_line.as_str() } else { l }).collect::<Vec<_>>().join("\n");
+    let inner = line
+        .trim()
+        .trim_start_matches("plugins=(")
+        .trim_end_matches(')')
+        .trim();
+    let new_line = if inner.is_empty() {
+        format!("{indent}plugins=({plugin})")
+    } else {
+        format!("{indent}plugins=({inner} {plugin})")
+    };
+    let text = rc
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == index { new_line.as_str() } else { l })
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(text + if rc.ends_with('\n') { "\n" } else { "" })
 }
 
@@ -481,7 +560,9 @@ pub fn with_block(text: &str, open: &str, close: &str, block: &str) -> String {
     if let (Some(start), Some(end)) = (text.find(open), text.find(close))
         && start < end
     {
-        let after = text[end + close.len()..].strip_prefix('\n').unwrap_or(&text[end + close.len()..]);
+        let after = text[end + close.len()..]
+            .strip_prefix('\n')
+            .unwrap_or(&text[end + close.len()..]);
         return format!("{}{block}{after}", &text[..start]);
     }
     let separator = match text {
@@ -495,7 +576,7 @@ pub fn with_block(text: &str, open: &str, close: &str, block: &str) -> String {
 
 /// A fresh, not yet created directory under the system temp dir for one test.
 #[cfg(test)]
-pub fn test_dir(name: &str) -> std::path::PathBuf {
+pub fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("kubewatcher-test-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
@@ -515,24 +596,53 @@ mod tests {
     fn builds_and_joins_argv() {
         assert_eq!(shell("echo hi"), ["sh", "-c", "echo hi"]);
         assert_eq!(shell_join(&shell("echo hi | wc")), "echo hi | wc");
-        let args = argv(&["kubectl", "get", "pods", "-o", "jsonpath={.items[*]}", "", "it's"]);
-        assert_eq!(shell_join(&args), r"kubectl get pods -o 'jsonpath={.items[*]}' '' 'it'\''s'");
+        let args = argv(&[
+            "kubectl",
+            "get",
+            "pods",
+            "-o",
+            "jsonpath={.items[*]}",
+            "",
+            "it's",
+        ]);
+        assert_eq!(
+            shell_join(&args),
+            r"kubectl get pods -o 'jsonpath={.items[*]}' '' 'it'\''s'"
+        );
     }
 
     #[test]
     fn run_capture_reports_stdout_or_the_best_error() {
         assert_eq!(run_capture(&shell("echo out")), Ok("out\n".into()));
-        assert_eq!(run_capture(&shell("echo out; echo bad >&2; exit 1")), Err("bad".into()));
-        assert_eq!(run_capture(&shell("echo only-stdout; exit 1")), Err("only-stdout".into()));
-        assert!(run_capture(&shell("exit 3")).unwrap_err().starts_with("exited with"));
-        assert!(run_capture(&argv(&["kubewatcher-no-such-program"])).unwrap_err().starts_with("failed to run"));
+        assert_eq!(
+            run_capture(&shell("echo out; echo bad >&2; exit 1")),
+            Err("bad".into())
+        );
+        assert_eq!(
+            run_capture(&shell("echo only-stdout; exit 1")),
+            Err("only-stdout".into())
+        );
+        assert!(
+            run_capture(&shell("exit 3"))
+                .unwrap_err()
+                .starts_with("exited with")
+        );
+        assert!(
+            run_capture(&argv(&["kubewatcher-no-such-program"]))
+                .unwrap_err()
+                .starts_with("failed to run")
+        );
     }
 
     #[test]
     fn spawn_capture_sends_the_result() {
         let (tx, rx) = mpsc::channel();
         spawn_capture(shell("echo done"), Target::Action, 7, tx);
-        let expected = Msg::Output { target: Target::Action, journal: 7, result: Ok("done\n".into()) };
+        let expected = Msg::Output {
+            target: Target::Action,
+            journal: 7,
+            result: Ok("done\n".into()),
+        };
         assert_eq!(rx.recv().unwrap(), expected);
     }
 
@@ -545,10 +655,23 @@ mod tests {
         // stdout and stderr are read by separate threads, so only the set is fixed.
         let messages: Vec<Msg> = rx.iter().collect();
         assert_eq!(messages.len(), 3);
-        assert!(messages.contains(&Msg::Line { generation: 3, line: "out".into() }));
-        assert!(messages.contains(&Msg::Line { generation: 3, line: "err".into() }));
+        assert!(messages.contains(&Msg::Line {
+            generation: 3,
+            line: "out".into()
+        }));
+        assert!(messages.contains(&Msg::Line {
+            generation: 3,
+            line: "err".into()
+        }));
         assert!(messages.contains(&Msg::StreamEnd { generation: 3 }));
-        assert!(spawn_stream(&argv(&["kubewatcher-no-such-program"]), 1, &mpsc::channel().0).is_err());
+        assert!(
+            spawn_stream(
+                &argv(&["kubewatcher-no-such-program"]),
+                1,
+                &mpsc::channel().0
+            )
+            .is_err()
+        );
     }
 
     /// A reader that fails, like a pipe whose process vanished.
@@ -563,14 +686,24 @@ mod tests {
     #[test]
     fn forward_lines_stops_on_errors_and_closed_receivers() {
         let (tx, rx) = mpsc::channel();
-        forward_lines(io::Cursor::new(b"a\r\nb".to_vec()), 1, tx.clone(), true).join().unwrap();
+        forward_lines(io::Cursor::new(b"a\r\nb".to_vec()), 1, tx.clone(), true)
+            .join()
+            .unwrap();
         forward_lines(Broken, 1, tx, false).join().unwrap();
-        let line = |text: &str| Msg::Line { generation: 1, line: text.into() };
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [line("a"), line("b"), Msg::StreamEnd { generation: 1 }]);
+        let line = |text: &str| Msg::Line {
+            generation: 1,
+            line: text.into(),
+        };
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [line("a"), line("b"), Msg::StreamEnd { generation: 1 }]
+        );
 
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        forward_lines(io::Cursor::new(b"ignored\n".to_vec()), 1, tx, true).join().unwrap();
+        forward_lines(io::Cursor::new(b"ignored\n".to_vec()), 1, tx, true)
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -584,13 +717,23 @@ mod tests {
         let status = |script: &str| Command::new("sh").args(["-c", script]).status();
         let args = argv(&["kubectl", "edit"]);
         assert_eq!(exit_outcome(&args, status("exit 0")), Ok(()));
-        assert!(exit_outcome(&args, status("exit 2")).unwrap_err().contains('2'));
-        assert_eq!(exit_outcome(&args, Err(io::Error::other("gone"))), Err("failed to run `kubectl`: gone".into()));
+        assert!(
+            exit_outcome(&args, status("exit 2"))
+                .unwrap_err()
+                .contains('2')
+        );
+        assert_eq!(
+            exit_outcome(&args, Err(io::Error::other("gone"))),
+            Err("failed to run `kubectl`: gone".into())
+        );
     }
 
     #[test]
     fn sanitize_line_strips_escapes_and_controls() {
-        assert_eq!(sanitize_line("\x1b[31mred\x1b[0m\tx\x1bM\x07!"), "red    x!");
+        assert_eq!(
+            sanitize_line("\x1b[31mred\x1b[0m\tx\x1bM\x07!"),
+            "red    x!"
+        );
     }
 
     #[test]
@@ -607,14 +750,32 @@ mod tests {
     #[test]
     fn edit_input_handles_line_editing_keys() {
         let mut buf = "kubectl get  ".to_string();
-        assert!(edit_input(&mut buf, key(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert!(edit_input(
+            &mut buf,
+            key(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(buf, "kubectl ");
-        assert!(edit_input(&mut buf, key(KeyCode::Char('x'), KeyModifiers::NONE)));
-        assert!(edit_input(&mut buf, key(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(edit_input(
+            &mut buf,
+            key(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(edit_input(
+            &mut buf,
+            key(KeyCode::Backspace, KeyModifiers::NONE)
+        ));
         assert_eq!(buf, "kubectl ");
-        assert!(!edit_input(&mut buf, key(KeyCode::Char('x'), KeyModifiers::CONTROL)));
-        assert!(!edit_input(&mut buf, key(KeyCode::Left, KeyModifiers::NONE)));
-        assert!(edit_input(&mut buf, key(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert!(!edit_input(
+            &mut buf,
+            key(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        ));
+        assert!(!edit_input(
+            &mut buf,
+            key(KeyCode::Left, KeyModifiers::NONE)
+        ));
+        assert!(edit_input(
+            &mut buf,
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(buf, "");
     }
 
@@ -637,10 +798,16 @@ mod tests {
     #[test]
     fn child_env_reaches_started_commands() {
         set_child_env("KUBEWATCHER_TEST_CHILD_ENV", "seen".into());
-        assert_eq!(run_capture(&shell("echo $KUBEWATCHER_TEST_CHILD_ENV")), Ok("seen\n".into()));
+        assert_eq!(
+            run_capture(&shell("echo $KUBEWATCHER_TEST_CHILD_ENV")),
+            Ok("seen\n".into())
+        );
         assert_eq!(child_env("KUBEWATCHER_TEST_CHILD_ENV"), Some("seen".into()));
         set_child_env("KUBEWATCHER_TEST_CHILD_ENV", "again".into());
-        assert_eq!(child_env("KUBEWATCHER_TEST_CHILD_ENV"), Some("again".into()));
+        assert_eq!(
+            child_env("KUBEWATCHER_TEST_CHILD_ENV"),
+            Some("again".into())
+        );
     }
 
     #[test]
@@ -652,17 +819,35 @@ mod tests {
         for name in ["b.yaml", "a.yaml", "notes.txt", "EXAMPLE.yaml.template"] {
             std::fs::write(config_d.join(name), "").unwrap();
         }
-        let files: Vec<PathBuf> = std::env::split_paths(&rebuild_kubeconfig(&home).unwrap()).collect();
-        assert_eq!(files, [home.join(".kube/config"), config_d.join("a.yaml"), config_d.join("b.yaml")]);
+        let files: Vec<PathBuf> =
+            std::env::split_paths(&rebuild_kubeconfig(&home).unwrap()).collect();
+        assert_eq!(
+            files,
+            [
+                home.join(".kube/config"),
+                config_d.join("a.yaml"),
+                config_d.join("b.yaml")
+            ]
+        );
         assert_eq!(context_file_path(&config_d, "a"), config_d.join("a-2.yaml"));
         assert_eq!(context_file_path(&config_d, "c"), config_d.join("c.yaml"));
 
         write_private(&config_d.join("secret.yaml"), "token").unwrap();
-        assert_eq!(std::fs::read_to_string(config_d.join("secret.yaml")).unwrap(), "token");
+        assert_eq!(
+            std::fs::read_to_string(config_d.join("secret.yaml")).unwrap(),
+            "token"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(config_d.join("secret.yaml")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(config_d.join("secret.yaml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
         let _ = std::fs::remove_dir_all(home);
     }
@@ -670,7 +855,10 @@ mod tests {
     #[test]
     fn context_file_names_are_safe() {
         assert_eq!(context_file_name("homelab"), "homelab");
-        assert_eq!(context_file_name("arn:aws:eks:eu/prod"), "arn-aws-eks-eu-prod");
+        assert_eq!(
+            context_file_name("arn:aws:eks:eu/prod"),
+            "arn-aws-eks-eu-prod"
+        );
         assert_eq!(context_file_name("admin@k3s.local"), "admin-k3s.local");
         assert_eq!(context_file_name(".."), "context");
     }
@@ -683,17 +871,28 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(find_program("tool", dir.as_os_str()), None, "not executable");
-            std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                find_program("tool", dir.as_os_str()),
+                None,
+                "not executable"
+            );
+            std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
-        assert_eq!(find_program("tool", dir.as_os_str()), Some(dir.join("tool")));
+        assert_eq!(
+            find_program("tool", dir.as_os_str()),
+            Some(dir.join("tool"))
+        );
         assert_eq!(find_program("other", dir.as_os_str()), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn versions_are_read_from_tool_output() {
-        assert_eq!(first_version("Client Version: v1.34.1\nKustomize Version: v5.7.1"), Some("1.34.1".into()));
+        assert_eq!(
+            first_version("Client Version: v1.34.1\nKustomize Version: v5.7.1"),
+            Some("1.34.1".into())
+        );
         assert_eq!(first_version("0.65.2 (b5e9d4a)"), Some("0.65.2".into()));
         assert_eq!(first_version("flux: v2.7.0"), Some("2.7.0".into()));
         assert_eq!(first_version("no version here 3"), None);
@@ -702,24 +901,48 @@ mod tests {
 
     #[test]
     fn rc_files_get_blocks_and_plugins() {
-        assert_eq!(add_omz_plugin("a\n  plugins=(git)\nb\n", "kubectl"), Some("a\n  plugins=(git kubectl)\nb\n".into()));
-        assert_eq!(add_omz_plugin("plugins=()", "kubectl"), Some("plugins=(kubectl)".into()));
+        assert_eq!(
+            add_omz_plugin("a\n  plugins=(git)\nb\n", "kubectl"),
+            Some("a\n  plugins=(git kubectl)\nb\n".into())
+        );
+        assert_eq!(
+            add_omz_plugin("plugins=()", "kubectl"),
+            Some("plugins=(kubectl)".into())
+        );
         assert_eq!(add_omz_plugin("plugins=(git kubectl)\n", "kubectl"), None);
         assert_eq!(add_omz_plugin("plugins=(\n  git\n)\n", "kubectl"), None);
         assert_eq!(add_omz_plugin("no plugins\n", "kubectl"), None);
-        assert!(omz_has_plugin("plugins=(git kubectl helm)", "kubectl") && !omz_has_plugin("plugins=(kubectl-x)", "kubectl"));
+        assert!(
+            omz_has_plugin("plugins=(git kubectl helm)", "kubectl")
+                && !omz_has_plugin("plugins=(kubectl-x)", "kubectl")
+        );
 
         let block = "# >>\nnew\n# <<\n";
         assert_eq!(with_block("", "# >>", "# <<", block), block);
-        assert_eq!(with_block("x", "# >>", "# <<", block), format!("x\n\n{block}"));
-        assert_eq!(with_block("x\n", "# >>", "# <<", block), format!("x\n\n{block}"));
-        assert_eq!(with_block("x\n# >>\nold\n# <<\ny\n", "# >>", "# <<", block), format!("x\n{block}y\n"));
+        assert_eq!(
+            with_block("x", "# >>", "# <<", block),
+            format!("x\n\n{block}")
+        );
+        assert_eq!(
+            with_block("x\n", "# >>", "# <<", block),
+            format!("x\n\n{block}")
+        );
+        assert_eq!(
+            with_block("x\n# >>\nold\n# <<\ny\n", "# >>", "# <<", block),
+            format!("x\n{block}y\n")
+        );
     }
 
     #[test]
     fn xdg_dir_prefers_the_variable_then_home() {
-        assert_eq!(xdg_dir("PATH", &["x"]), std::env::var_os("PATH").map(std::path::PathBuf::from));
-        let home = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"));
-        assert_eq!(xdg_dir("KUBEWATCHER_TEST_UNSET_VARIABLE", &[".config"]), home);
+        assert_eq!(
+            xdg_dir("PATH", &["x"]),
+            std::env::var_os("PATH").map(PathBuf::from)
+        );
+        let home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"));
+        assert_eq!(
+            xdg_dir("KUBEWATCHER_TEST_UNSET_VARIABLE", &[".config"]),
+            home
+        );
     }
 }
