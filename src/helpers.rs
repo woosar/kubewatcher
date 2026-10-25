@@ -392,8 +392,10 @@ pub fn xdg_dir(env_var: &str, fallback: &[&str]) -> Option<PathBuf> {
 }
 
 /// `~/.kube/config` followed by every `~/.kube/config.d/*.yaml` in name order, like the
-/// shell's `kubeconfig_rebuild`; None without a config.d directory (KUBECONFIG stays as it is).
-pub fn rebuild_kubeconfig(home: &Path) -> Option<OsString> {
+/// shell's `kubeconfig_rebuild`, then every file of the `inherited` KUBECONFIG not listed yet,
+/// so contexts kept elsewhere (e.g. ~/.kube/config_teststand1) stay reachable; None without
+/// a config.d directory (KUBECONFIG stays as it is).
+pub fn rebuild_kubeconfig(home: &Path, inherited: Option<&OsStr>) -> Option<OsString> {
     let config_d = home.join(".kube").join("config.d");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&config_d)
         .ok()?
@@ -402,6 +404,11 @@ pub fn rebuild_kubeconfig(home: &Path) -> Option<OsString> {
         .collect();
     files.sort();
     files.insert(0, home.join(".kube").join("config"));
+    for path in inherited.map(std::env::split_paths).into_iter().flatten() {
+        if !path.as_os_str().is_empty() && !files.contains(&path) {
+            files.push(path);
+        }
+    }
     std::env::join_paths(files).ok()
 }
 
@@ -410,6 +417,21 @@ pub fn kubeconfig_files(home: &Path) -> Vec<PathBuf> {
     match child_env("KUBECONFIG").filter(|v| !v.is_empty()) {
         Some(value) => std::env::split_paths(&value).collect(),
         None => vec![home.join(".kube").join("config")],
+    }
+}
+
+/// `10.0.0.5` → `https://10.0.0.5:6443`, `host:443` → `https://host:443`, `::1` → `https://[::1]:6443`,
+/// URLs stay as they are.
+pub fn server_url(server: &str) -> String {
+    if server.contains("://") {
+        return server.to_string();
+    }
+    // The last colon separates a port, unless it is part of a bare IPv6 address.
+    let has_port = server.rsplit_once(':').is_some_and(|(host, port)| port.parse::<u16>().is_ok() && (!host.contains(':') || host.ends_with(']')));
+    match (has_port, server.contains(':')) {
+        (true, _) => format!("https://{server}"),
+        (false, true) => format!("https://[{server}]:6443"),
+        (false, false) => format!("https://{server}:6443"),
     }
 }
 
@@ -811,22 +833,46 @@ mod tests {
     }
 
     #[test]
+    fn server_url_adds_scheme_and_default_port() {
+        assert_eq!(server_url("pi.local"), "https://pi.local:6443");
+        assert_eq!(server_url("pi.local:443"), "https://pi.local:443");
+        assert_eq!(server_url("[::1]:8443"), "https://[::1]:8443");
+        assert_eq!(server_url("::1"), "https://[::1]:6443");
+        assert_eq!(server_url("http://x:80"), "http://x:80");
+    }
+
+    #[test]
     fn kubeconfig_is_rebuilt_from_config_d() {
         let home = test_dir("rebuild");
-        assert_eq!(rebuild_kubeconfig(&home), None);
+        assert_eq!(rebuild_kubeconfig(&home, None), None);
         let config_d = home.join(".kube/config.d");
         std::fs::create_dir_all(&config_d).unwrap();
         for name in ["b.yaml", "a.yaml", "notes.txt", "EXAMPLE.yaml.template"] {
             std::fs::write(config_d.join(name), "").unwrap();
         }
         let files: Vec<PathBuf> =
-            std::env::split_paths(&rebuild_kubeconfig(&home).unwrap()).collect();
+            std::env::split_paths(&rebuild_kubeconfig(&home, None).unwrap()).collect();
         assert_eq!(
             files,
             [
                 home.join(".kube/config"),
                 config_d.join("a.yaml"),
                 config_d.join("b.yaml")
+            ]
+        );
+
+        // Files from the KUBECONFIG kubewatcher started with are kept, without duplicates.
+        let teststand = home.join(".kube/config_teststand1");
+        let inherited = std::env::join_paths([teststand.clone(), home.join(".kube/config")]).unwrap();
+        let files: Vec<PathBuf> =
+            std::env::split_paths(&rebuild_kubeconfig(&home, Some(&inherited)).unwrap()).collect();
+        assert_eq!(
+            files,
+            [
+                home.join(".kube/config"),
+                config_d.join("a.yaml"),
+                config_d.join("b.yaml"),
+                teststand
             ]
         );
         assert_eq!(context_file_path(&config_d, "a"), config_d.join("a-2.yaml"));

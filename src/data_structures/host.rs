@@ -23,6 +23,9 @@ pub trait Host {
     fn next_event(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
     /// Runs a command on the real terminal (exec -it, edit, `!cmd`).
     fn interactive(&mut self, argv: &[String], pause: bool) -> io::Result<Result<(), String>>;
+    /// Like `interactive`, but also hands back what the command printed (ssh + sudo cat):
+    /// password prompts reach the terminal, everything from `hide_from` on is only captured.
+    fn interactive_capture(&mut self, argv: &[String], hide_from: &str) -> io::Result<Result<String, String>>;
 }
 
 /// The real host: processes via `std::process`, keys via crossterm, the real tty.
@@ -79,5 +82,60 @@ impl Host for SystemHost {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
         Ok(outcome)
+    }
+
+    fn interactive_capture(&mut self, argv: &[String], hide_from: &str) -> io::Result<Result<String, String>> {
+        use std::io::{Read, Write};
+        use std::process::Stdio;
+
+        use ratatui::crossterm::execute;
+        use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        println!("\x1b[2m$ {}\x1b[0m", crate::helpers::shell_join(argv));
+
+        let mut captured = Vec::new();
+        let outcome = match crate::helpers::command(argv).stdout(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                // Echo until the secret part starts, so prompts stay visible but keys never hit the screen.
+                let mut stdout = child.stdout.take().expect("stdout is piped");
+                let mut shown = 0;
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stdout.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    captured.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&captured);
+                    let visible = text.find(hide_from).unwrap_or(text.len());
+                    if visible > shown {
+                        print!("{}", &text[shown..visible]);
+                        io::stdout().flush()?;
+                        shown = visible;
+                    }
+                }
+                crate::helpers::exit_outcome(argv, child.wait())
+            }
+            Err(e) => crate::helpers::exit_outcome(argv, Err(e)),
+        };
+        let found = String::from_utf8_lossy(&captured).contains(hide_from);
+        if found {
+            println!("\n[read {} bytes, contents not shown]", captured.len());
+        }
+        if let Err(e) = &outcome {
+            println!("\n[{e}]");
+        }
+        if outcome.is_err() || !found {
+            print!("\nPress Enter to return to kubewatcher...");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+        }
+
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(outcome.map(|()| String::from_utf8_lossy(&captured).into_owned()))
     }
 }

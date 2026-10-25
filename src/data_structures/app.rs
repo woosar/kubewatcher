@@ -16,7 +16,7 @@ use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
 use crate::data_structures::{
-    COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, FormAction, Host, Journal, KubeTable, Machine, Msg, RunMode, TOKEN_MASK, Target,
+    COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, FormAction, Host, Journal, K3sForm, KubeTable, Machine, Msg, RunMode, TOKEN_MASK, Target,
     Theme, Tool, ToolKind, Viewer, ViewerAction,
 };
 use crate::helpers::{self, argv};
@@ -76,6 +76,7 @@ enum Mode {
     Prompt(Prompt),
     Confirm { message: String, argv: Vec<String> },
     AddContext(ContextForm),
+    ImportK3s(K3sForm),
     /// Like Confirm, for changes kubewatcher makes itself (rc file, splitting kubeconfigs).
     ConfirmPlan { title: String, lines: Vec<String>, plan: Plan },
     /// Tools are missing: only the Tooling tab works until they are installed.
@@ -257,6 +258,8 @@ struct Interactive {
     argv: Vec<String>,
     pause: bool,
     journal: u64,
+    /// Set when the command prints a k3s.yaml to build this context from.
+    k3s: Option<K3sForm>,
 }
 
 /// Selection + filter state shared by the table-based tabs.
@@ -497,7 +500,13 @@ impl App {
                 self.handle_msg(msg);
             }
             self.tick();
-            if let Some(job) = self.pending_interactive.take() {
+            if let Some(mut job) = self.pending_interactive.take() {
+                if let Some(form) = job.k3s.take() {
+                    let output = self.host.interactive_capture(&job.argv, "apiVersion:")?;
+                    terminal.clear().map_err(io::Error::other)?;
+                    self.finish_k3s_import(job.journal, &form, output);
+                    continue;
+                }
                 let outcome = self.host.interactive(&job.argv, job.pause)?;
                 terminal.clear().map_err(io::Error::other)?;
                 match outcome {
@@ -631,10 +640,12 @@ impl App {
     }
 
     /// Points KUBECONFIG at ~/.kube/config plus every file in config.d, like the shell's
-    /// `kubeconfig_rebuild`, so added and split contexts show up right away.
+    /// `kubeconfig_rebuild`, so added and split contexts show up right away. Files from the
+    /// KUBECONFIG kubewatcher was started with stay in, or their contexts would vanish.
     fn rebuild_kubeconfig(&mut self) -> Vec<PathBuf> {
         let Some(machine) = &self.machine else { return Vec::new() };
-        match helpers::rebuild_kubeconfig(&machine.home) {
+        let inherited = std::env::var_os("KUBECONFIG");
+        match helpers::rebuild_kubeconfig(&machine.home, inherited.as_deref()) {
             Some(value) => {
                 let files = std::env::split_paths(&value).collect();
                 helpers::set_child_env("KUBECONFIG", value);
@@ -755,7 +766,7 @@ impl App {
     /// Hands the real terminal to a command after this frame.
     fn queue_interactive(&mut self, argv: Vec<String>, pause: bool, origin: &str) {
         let journal = self.journal.record(&argv, origin, RunMode::Interactive, false);
-        self.pending_interactive = Some(Interactive { argv, pause, journal });
+        self.pending_interactive = Some(Interactive { argv, pause, journal, k3s: None });
     }
 
     fn kind(&self) -> &'static ResourceKind {
@@ -1001,6 +1012,7 @@ impl App {
                 _ => self.mode = Mode::Confirm { message, argv },
             },
             Mode::AddContext(form) => self.handle_add_context_key(key, form),
+            Mode::ImportK3s(form) => self.handle_import_k3s_key(key, form),
             Mode::ConfirmPlan { title, lines, plan } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.execute_plan(plan),
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => self.set_status("cancelled".into()),
@@ -1162,6 +1174,7 @@ impl App {
                 self.open_viewer("version".into(), argv(&["kubectl", "version"]), false, None);
             }
             KeyCode::Char('a') if self.machine.is_some() => self.mode = Mode::AddContext(ContextForm::default()),
+            KeyCode::Char('K') if self.machine.is_some() => self.mode = Mode::ImportK3s(K3sForm::default()),
             KeyCode::Char('x') => self.remove_context(),
             KeyCode::Char('S') => self.plan_restructure(),
             _ => {}
@@ -1211,11 +1224,60 @@ impl App {
         self.mode = Mode::AddContext(form);
     }
 
-    /// Runs the `kubectl config` writes; the journal and status bar only ever see the masked token.
+    fn handle_import_k3s_key(&mut self, key: KeyEvent, mut form: K3sForm) {
+        match form.handle_key(key) {
+            FormAction::Cancel => return self.set_status("cancelled".into()),
+            FormAction::None => {}
+            FormAction::Submit => {
+                let name = form.name().to_string();
+                // Checked before ssh, so no passwords are typed for nothing.
+                if Self::column_values(&self.contexts.table, "NAME").contains(&name) {
+                    self.set_error(format!("context {name} already exists; pick another name"));
+                } else {
+                    match form.fetch() {
+                        Ok(argv) => {
+                            let journal = self.journal.record(&argv, &format!("Contexts ▸ import {name} from k3s"), RunMode::Interactive, false);
+                            self.pending_interactive = Some(Interactive { argv, pause: false, journal, k3s: Some(form) });
+                            return;
+                        }
+                        Err(e) => self.set_error(e),
+                    }
+                }
+            }
+        }
+        self.mode = Mode::ImportK3s(form);
+    }
+
+    /// Writes the context from what `ssh … sudo cat k3s.yaml` printed.
+    fn finish_k3s_import(&mut self, journal: u64, form: &K3sForm, output: Result<String, String>) {
+        let Some(machine) = self.machine.clone() else { return };
+        let commands = output.and_then(|text| form.commands(&helpers::context_file_path(&machine.config_d(), form.name()), &text));
+        match commands {
+            Ok(commands) => {
+                self.journal.finish(journal, true, "read k3s.yaml (client certificate and key kept, not logged)");
+                self.save_context(form.name(), &commands);
+            }
+            Err(e) => {
+                self.journal.finish(journal, false, &e);
+                self.set_error(e);
+            }
+        }
+    }
+
+    /// Runs the `kubectl config` writes; the journal and status bar only ever see masked
+    /// secrets: the token and every value set for a `…-data` property.
     fn save_context(&mut self, name: &str, commands: &[Vec<String>]) {
         let join = |mask: bool| {
-            let mask_token = |arg: &String| if mask && arg.starts_with("--token=") { TOKEN_MASK.to_string() } else { arg.clone() };
-            let render = |argv: &Vec<String>| helpers::shell_join(&argv.iter().map(mask_token).collect::<Vec<_>>());
+            let mask_secret = |(i, arg): (usize, &String), argv: &[String]| {
+                if mask && arg.starts_with("--token=") {
+                    TOKEN_MASK.to_string()
+                } else if mask && i > 0 && argv[i - 1].ends_with("-data") {
+                    "••••".to_string()
+                } else {
+                    arg.clone()
+                }
+            };
+            let render = |argv: &Vec<String>| helpers::shell_join(&argv.iter().enumerate().map(|a| mask_secret(a, argv)).collect::<Vec<_>>());
             commands.iter().map(render).collect::<Vec<_>>().join(" && ")
         };
         let shown = helpers::shell(&join(true));
@@ -2098,10 +2160,11 @@ impl App {
             (Mode::Confirm { .. }, ..) => &[("y", "run it"), ("e", "edit in prompt first"), ("n", "cancel")],
             (_, true, _) => &[("q", "close"), ("w", "watch"), ("r", "rerun"), ("f", "follow")],
             (Mode::AddContext(_), ..) => &[("Tab", "next field"), ("Enter", "next / save"), ("Esc", "cancel")],
+            (Mode::ImportK3s(_), ..) => &[("Tab", "next field"), ("Enter", "next / fetch"), ("Esc", "cancel")],
             (Mode::ConfirmPlan { .. }, ..) => &[("y", "do it"), ("n", "cancel")],
             (Mode::Blocked { .. }, ..) => &[("Enter", "open Tooling"), ("q", "quit")],
             (_, _, Tab::Contexts) => {
-                resource_hints = [("Enter", "use context"), ("a", "add"), ("x", "remove")]
+                resource_hints = [("Enter", "use context"), ("a", "add"), ("K", "import k3s"), ("x", "remove")]
                     .into_iter()
                     .chain((!self.files_to_split().is_empty()).then_some(("S", "one file per context")))
                     .chain([("i", "cluster-info"), ("v", "version")])
@@ -2181,6 +2244,13 @@ impl App {
                 Self::popup(frame, area, " Input ", theme, theme.accent, 60, 5, Paragraph::new(text));
             }
             Mode::AddContext(form) => {
+                let file = match (&self.machine, form.name()) {
+                    (Some(machine), name) if !name.is_empty() => machine.display(&helpers::context_file_path(&machine.config_d(), name)),
+                    _ => "~/.kube/config.d/<name>.yaml".into(),
+                };
+                form.render(frame, area, &file, theme);
+            }
+            Mode::ImportK3s(form) => {
                 let file = match (&self.machine, form.name()) {
                     (Some(machine), name) if !name.is_empty() => machine.display(&helpers::context_file_path(&machine.config_d(), name)),
                     _ => "~/.kube/config.d/<name>.yaml".into(),
@@ -2332,7 +2402,8 @@ GLOBAL
   J              toggle command strip    P        manage port-forwards      q  quit
   T              next color theme (files in ~/.config/kubewatcher/themes/, choice in config.toml)
 CONTEXTS (1)
-  Enter use context   a add (name, server, namespace, token)   x remove (deletes its own file)
+  Enter use context   a add (name, server, namespace, token or cert + key data)   x remove (own file)
+  K import from k3s: name + IP → ssh -t <ip> sudo cat /etc/rancher/k3s/k3s.yaml, keeps cert + key
   one file per context in ~/.kube/config.d · S splits files holding several (backup first)
 TOOLING (5)
   kubectl, kubectx/kubens, fzf, helm, flux into ~/.local/bin, kubeconfig layout, shell wiring
@@ -2464,6 +2535,13 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         fn interactive(&mut self, argv: &[String], _pause: bool) -> io::Result<Result<(), String>> {
             self.record("interactive", argv);
             Ok(if helpers::shell_join(argv).contains("fail") { Err("exit status: 1".into()) } else { Ok(()) })
+        }
+
+        fn interactive_capture(&mut self, argv: &[String], _hide_from: &str) -> io::Result<Result<String, String>> {
+            self.record("interactive", argv);
+            let command = helpers::shell_join(argv);
+            let reply = self.0.borrow().replies.iter().find(|(prefix, _)| command.starts_with(prefix)).map(|(_, r)| r.clone());
+            Ok(reply.unwrap_or_else(|| Err("no scripted reply".into())))
         }
     }
 
@@ -2687,6 +2765,51 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
     }
 
     #[test]
+    fn k3s_import_reads_k3s_yaml_over_ssh_and_logs_no_secrets() {
+        let (mut app, script, machine, _dir) = machine_app("app-k3s", true);
+        assert!(!app.locked);
+        app.on_output(Target::Contexts, Ok(CONTEXTS.into()));
+        app.tab = Tab::Contexts;
+
+        // A taken name is refused before any ssh.
+        press(&mut app, KeyCode::Char('K'));
+        keys(&mut app, "prod");
+        press(&mut app, KeyCode::Enter);
+        keys(&mut app, "10.5.15.190");
+        press(&mut app, KeyCode::Enter);
+        assert!(status(&app).contains("already exists") && matches!(app.mode, Mode::ImportK3s(_)), "{}", status(&app));
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('K'));
+        keys(&mut app, "teststand3");
+        press(&mut app, KeyCode::Enter);
+        keys(&mut app, "additive@10.5.15.190");
+        assert!(draw(&mut app).contains("ssh -t additive@10.5.15.190 sudo cat /etc/rancher/k3s/k3s.yaml"));
+        press(&mut app, KeyCode::Enter);
+        let mut job = app.pending_interactive.take().unwrap();
+        assert_eq!(helpers::shell_join(&job.argv), "ssh -t additive@10.5.15.190 'sudo cat /etc/rancher/k3s/k3s.yaml'");
+
+        let k3s_yaml = "[sudo] password for additive: \r\napiVersion: v1\r\n    server: https://0.0.0.0:6443\r\n    client-certificate-data: Q0VSVA==\r\n    client-key-data: S0VZ\r\n";
+        script.borrow_mut().replies = vec![("ssh -t", Ok(k3s_yaml.into()))];
+        let output = app.host.interactive_capture(&job.argv, "apiVersion:").unwrap();
+        app.finish_k3s_import(job.journal, &job.k3s.take().unwrap(), output);
+        let file = machine.config_d().join("teststand3.yaml");
+        let ran = last(&script);
+        assert!(ran.contains("set-cluster teststand3 --server=https://10.5.15.190:6443 --insecure-skip-tls-verify=true"), "{ran}");
+        assert!(ran.contains("set users.teststand3.client-certificate-data Q0VSVA==") && ran.contains("set users.teststand3.client-key-data S0VZ"), "{ran}");
+        assert!(ran.contains(&format!("--kubeconfig={}", file.display())), "{ran}");
+        assert!(!status(&app).contains("Q0VSVA"));
+        app.tab = Tab::Journal;
+        let journal = draw(&mut app);
+        assert!(journal.contains("import teststand3") && !journal.contains("Q0VSVA") && !journal.contains("S0VZ"), "{journal}");
+
+        // Without the yaml (wrong sudo password) nothing is written.
+        script.borrow_mut().commands.clear();
+        app.finish_k3s_import(0, &K3sForm::default(), Ok("Sorry, try again.\r\n".into()));
+        assert!(status(&app).contains("no server") && script.borrow().commands.is_empty());
+    }
+
+    #[test]
     fn contexts_get_a_file_each_and_can_be_split_and_removed() {
         let (mut app, script, machine, dir) = machine_app("app-contexts", true);
         assert!(!app.locked);
@@ -2706,7 +2829,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
 
         // Adding: a taken name is refused; a new one gets its own file.
         press(&mut app, KeyCode::Char('a'));
-        for value in ["prod", "10.0.0.5", "", "s3cret"] {
+        for value in ["prod", "10.0.0.5", "", "s3cret", "", ""] {
             keys(&mut app, value);
             press(&mut app, KeyCode::Tab);
         }
@@ -2717,7 +2840,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         press(&mut app, KeyCode::Char('a'));
         keys(&mut app, "lab");
         assert!(draw(&mut app).contains("~/.kube/config.d/lab.yaml"));
-        for value in ["", "10.0.0.5", "", "s3cret"] {
+        for value in ["", "10.0.0.5", "", "s3cret", "", ""] {
             keys(&mut app, value);
             press(&mut app, KeyCode::Enter);
         }
