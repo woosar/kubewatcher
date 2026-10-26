@@ -2594,6 +2594,27 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
     }
 
     #[test]
+    fn large_tables_draw_only_the_rows_in_view_and_follow_the_selection() {
+        let (mut app, _script) = loaded();
+        let mut text = String::from("NAME       STATUS\n");
+        for i in 0..5000 {
+            text.push_str(&format!("pod-{i:04}   Running\n"));
+        }
+        app.resources.set_result(Ok(KubeTable::parse(&text)));
+        let screen = draw(&mut app);
+        assert!(screen.contains("pod-0000"), "{screen}");
+        for _ in 0..100 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let screen = draw(&mut app);
+        assert!(screen.contains("▶ pod-0100") && !screen.contains("pod-0000"), "{screen}");
+        press(&mut app, KeyCode::Char('k'));
+        assert!(draw(&mut app).contains("▶ pod-0099"));
+        press(&mut app, KeyCode::Char('g'));
+        assert!(draw(&mut app).contains("▶ pod-0000"));
+    }
+
+    #[test]
     fn run_loop_drives_keys_messages_and_the_terminal() {
         let (app, script) = app();
         {

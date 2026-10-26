@@ -132,9 +132,24 @@ impl KubeTable {
         }
         let constraints = widths.iter().map(|w| Constraint::Length((*w).min(MAX_COLUMN_WIDTH) as u16));
 
+        // Only the rows that fit are built: with thousands of pods, building every row on
+        // every frame made scrolling lag. The scroll offset is kept in `state` as ratatui would.
+        let height = block.inner(area).height.saturating_sub(1) as usize;
+        let selected = state.selected().map(|s| s.min(visible.len().saturating_sub(1)));
+        let mut offset = state.offset().min(visible.len().saturating_sub(height));
+        if let Some(selected) = selected {
+            if selected < offset {
+                offset = selected;
+            } else if height > 0 && selected >= offset + height {
+                offset = selected + 1 - height;
+            }
+        }
+        let window = &visible[offset..(offset + height).min(visible.len())];
+        let mut window_state = TableState::default().with_selected(selected.map(|s| s - offset));
+
         let header = Row::new(self.headers.iter().map(|h| Cell::from(h.as_str())))
             .style(theme.header());
-        let rows = visible.iter().map(|&i| {
+        let rows = window.iter().map(|&i| {
             let row = &self.rows[i];
             let cells = row.iter().enumerate().map(|(c, text)| {
                 let cell = Cell::from(text.as_str());
@@ -156,7 +171,8 @@ impl KubeTable {
             .column_spacing(2)
             .row_highlight_style(theme.selected())
             .highlight_symbol("▶ ");
-        frame.render_stateful_widget(table, area, state);
+        frame.render_stateful_widget(table, area, &mut window_state);
+        *state.offset_mut() = offset;
     }
 
     /// Colors well-known states: pod/helm STATUS, flux READY ("True"/"False") and SUSPENDED.
