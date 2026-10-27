@@ -83,6 +83,8 @@ enum Mode {
     Blocked { missing: Vec<String> },
     Namespaces,
     PortForwards,
+    /// The workload behind `e` has several pods: which one to open a shell in.
+    PickPod { owner: String, namespace: Option<String>, pods: Vec<(String, String)> },
     Help,
     /// Waiting for the key after the leader (Space).
     Leader,
@@ -134,6 +136,7 @@ struct ResourceKind {
     name: &'static str,
     namespaced: bool,
     logs: bool,
+    /// `e` opens a shell: in the pod itself, or in one of the workload's pods.
     exec: bool,
     restart: bool,
     scale: bool,
@@ -152,11 +155,11 @@ const NAMESPACED: ResourceKind = ResourceKind {
 
 const KINDS: &[ResourceKind] = &[
     ResourceKind { name: "pods", logs: true, exec: true, forward: true, ..NAMESPACED },
-    ResourceKind { name: "deployments", logs: true, restart: true, scale: true, forward: true, ..NAMESPACED },
-    ResourceKind { name: "statefulsets", logs: true, restart: true, scale: true, forward: true, ..NAMESPACED },
-    ResourceKind { name: "daemonsets", logs: true, restart: true, ..NAMESPACED },
-    ResourceKind { name: "replicasets", scale: true, ..NAMESPACED },
-    ResourceKind { name: "jobs", logs: true, ..NAMESPACED },
+    ResourceKind { name: "deployments", logs: true, exec: true, restart: true, scale: true, forward: true, ..NAMESPACED },
+    ResourceKind { name: "statefulsets", logs: true, exec: true, restart: true, scale: true, forward: true, ..NAMESPACED },
+    ResourceKind { name: "daemonsets", logs: true, exec: true, restart: true, ..NAMESPACED },
+    ResourceKind { name: "replicasets", exec: true, scale: true, ..NAMESPACED },
+    ResourceKind { name: "jobs", logs: true, exec: true, ..NAMESPACED },
     ResourceKind { name: "cronjobs", ..NAMESPACED },
     ResourceKind { name: "services", forward: true, ..NAMESPACED },
     ResourceKind { name: "ingresses", ..NAMESPACED },
@@ -260,6 +263,13 @@ struct Interactive {
     journal: u64,
     /// Set when the command prints a k3s.yaml to build this context from.
     k3s: Option<K3sForm>,
+}
+
+/// `e` on a workload: its selector is read first, then its pods are listed.
+struct PodLookup {
+    request: u64,
+    owner: String,
+    namespace: Option<String>,
 }
 
 /// Selection + filter state shared by the table-based tabs.
@@ -385,6 +395,9 @@ pub struct App {
     namespace_initialized: bool,
     namespaces: Vec<String>,
     namespace_state: ListState,
+    pod_lookup: Option<PodLookup>,
+    next_pod_lookup: u64,
+    pod_pick_state: ListState,
     namespace_filter: String,
 
     kind_index: usize,
@@ -454,6 +467,9 @@ impl App {
             namespace_initialized: false,
             namespaces: Vec::new(),
             namespace_state: ListState::default(),
+            pod_lookup: None,
+            next_pod_lookup: 0,
+            pod_pick_state: ListState::default(),
             namespace_filter: String::new(),
             kind_index: 0,
             resources: TablePane::default(),
@@ -590,6 +606,8 @@ impl App {
                 }
             }
             Target::Tooling { row, latest } => self.on_tooling(row, latest, result),
+            Target::PodSelector(request) => self.on_pod_selector(request, result),
+            Target::PodList(request) => self.on_pod_list(request, result),
             Target::Action => {
                 match result {
                     Ok(out) => {
@@ -1025,6 +1043,7 @@ impl App {
             },
             Mode::Namespaces => self.handle_namespace_key(key),
             Mode::PortForwards => self.handle_port_forward_key(key),
+            Mode::PickPod { owner, namespace, pods } => self.handle_pick_pod_key(key, owner, namespace, pods),
             Mode::Help => {
                 if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                     self.mode = Mode::Help;
@@ -1505,6 +1524,87 @@ impl App {
         argv
     }
 
+    /// `kubectl exec -it <pod> -- sh -c '…'`: bash when the image has it, sh otherwise.
+    fn shell_into(&mut self, pod: &str, namespace: &Option<String>) {
+        let shell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+        let argv = Self::with_namespace(argv(&["kubectl", "exec", "-it", pod]), namespace)
+            .into_iter()
+            .chain(argv(&["--", "sh", "-c", shell]))
+            .collect();
+        self.queue_interactive(argv, false, &format!("Resources ▸ shell into pods/{pod}"));
+    }
+
+    /// Step one of `e` on a workload: which labels select its pods.
+    fn look_up_pods(&mut self, owner: String, namespace: Option<String>) {
+        self.next_pod_lookup += 1;
+        let request = self.next_pod_lookup;
+        let argv = Self::with_namespace(argv(&["kubectl", "get", &owner, "-o", "jsonpath={.spec.selector.matchLabels}"]), &namespace);
+        self.set_status(format!("$ {}", helpers::shell_join(&argv)));
+        self.capture(argv, Target::PodSelector(request), &format!("Resources ▸ shell: pods of {owner}"), false);
+        self.pod_lookup = Some(PodLookup { request, owner, namespace });
+    }
+
+    /// Step two: `{"app":"web"}` → `kubectl get pods -l app=web`.
+    fn on_pod_selector(&mut self, request: u64, result: Result<String, String>) {
+        let Some(lookup) = self.pod_lookup.as_ref().filter(|l| l.request == request) else { return };
+        let (owner, namespace) = (lookup.owner.clone(), lookup.namespace.clone());
+        let labels = result.and_then(|text| {
+            let map: serde_json::Map<String, Value> = serde_json::from_str(text.trim()).unwrap_or_default();
+            let labels: Vec<String> = map.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect();
+            if labels.is_empty() { Err(format!("{owner} has no matchLabels selector; pick a pod under pods instead")) } else { Ok(labels.join(",")) }
+        });
+        match labels {
+            Ok(labels) => {
+                let argv = Self::with_namespace(argv(&["kubectl", "get", "pods", "-l", &labels]), &namespace);
+                self.set_status(format!("$ {}", helpers::shell_join(&argv)));
+                self.capture(argv, Target::PodList(request), &format!("Resources ▸ shell: pods of {owner}"), false);
+            }
+            Err(e) => {
+                self.pod_lookup = None;
+                self.set_error(e);
+            }
+        }
+    }
+
+    /// Step three: one pod → shell right away; several → you pick one.
+    fn on_pod_list(&mut self, request: u64, result: Result<String, String>) {
+        let Some(lookup) = self.pod_lookup.take_if(|l| l.request == request) else { return };
+        let table = match result {
+            Ok(text) => KubeTable::parse(&text),
+            Err(e) => return self.set_error(e),
+        };
+        let pods: Vec<(String, String)> = table
+            .rows
+            .iter()
+            .filter_map(|row| Some((table.cell(row, "NAME")?.to_string(), table.cell(row, "STATUS").unwrap_or_default().to_string())))
+            .collect();
+        match pods.as_slice() {
+            [] => self.set_error(format!("{} has no pods", lookup.owner)),
+            [(pod, _)] => self.shell_into(pod, &lookup.namespace),
+            _ => {
+                let running = pods.iter().position(|(_, status)| status == "Running").unwrap_or(0);
+                self.pod_pick_state.select(Some(running));
+                self.mode = Mode::PickPod { owner: lookup.owner, namespace: lookup.namespace, pods };
+            }
+        }
+    }
+
+    fn handle_pick_pod_key(&mut self, key: KeyEvent, owner: String, namespace: Option<String>, pods: Vec<(String, String)>) {
+        let selected = self.pod_pick_state.selected();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return self.set_status("cancelled".into()),
+            KeyCode::Down | KeyCode::Char('j') => self.pod_pick_state.select(helpers::step_selection(selected, pods.len(), 1)),
+            KeyCode::Up | KeyCode::Char('k') => self.pod_pick_state.select(helpers::step_selection(selected, pods.len(), -1)),
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if let Some((pod, _)) = selected.and_then(|i| pods.get(i)) {
+                    return self.shell_into(pod, &namespace);
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::PickPod { owner, namespace, pods };
+    }
+
     fn handle_resources_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Left | KeyCode::Char('[') => return self.select_kind(-1),
@@ -1552,14 +1652,8 @@ impl App {
                 );
                 self.open_viewer(format!("previous logs {target}"), argv, false, None);
             }
-            KeyCode::Char('e') if kind.exec => {
-                let shell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
-                let argv = Self::with_namespace(argv(&["kubectl", "exec", "-it", &name]), &ns)
-                    .into_iter()
-                    .chain(argv(&["--", "sh", "-c", shell]))
-                    .collect();
-                self.queue_interactive(argv, false, &format!("Resources ▸ shell into {target}"));
-            }
+            KeyCode::Char('e') if kind.name == "pods" => self.shell_into(&name, &ns),
+            KeyCode::Char('e') if kind.exec => self.look_up_pods(target, ns),
             KeyCode::Char('E') => {
                 let argv = Self::with_namespace(argv(&["kubectl", "edit", &target]), &ns);
                 self.queue_interactive(argv, false, &format!("Resources ▸ edit {target}"));
@@ -2156,6 +2250,7 @@ impl App {
             (Mode::AddContext(_), ..) => &[("Tab", "next field"), ("Enter", "next / save"), ("Esc", "cancel")],
             (Mode::ImportK3s(_), ..) => &[("Tab", "next field"), ("Enter", "next / fetch"), ("Esc", "cancel")],
             (Mode::ConfirmPlan { .. }, ..) => &[("y", "do it"), ("n", "cancel")],
+            (Mode::PickPod { .. }, ..) => &[("↑↓", "pod"), ("Enter", "shell into it"), ("Esc", "cancel")],
             (Mode::Blocked { .. }, ..) => &[("Enter", "open Tooling"), ("q", "quit")],
             (_, _, Tab::Contexts) => {
                 resource_hints = [("Enter", "use context"), ("a", "add"), ("K", "import k3s"), ("x", "remove")]
@@ -2172,7 +2267,7 @@ impl App {
                 let optional = [
                     (kind.logs, ("l", "logs")),
                     (kind.name == "pods", ("L", "prev logs")),
-                    (kind.exec, ("e", "exec")),
+                    (kind.exec, ("e", "shell")),
                     (kind.forward, ("f", "fwd")),
                     (kind.scale, ("s", "scale")),
                     (kind.restart, ("r", "restart")),
@@ -2292,6 +2387,29 @@ impl App {
                 frame.render_widget(Clear, popup);
                 frame.render_stateful_widget(list, popup, &mut self.namespace_state);
             }
+            Mode::PickPod { owner, pods, .. } => {
+                let height = (pods.len() as u16 + 2).min(area.height);
+                let popup = area.centered(Constraint::Length(80.min(area.width)), Constraint::Length(height));
+                let items: Vec<ListItem> = pods
+                    .iter()
+                    .map(|(pod, status)| {
+                        let item = ListItem::new(format!("{pod:<55} {status}"));
+                        if status == "Running" { item } else { item.style(theme.fg(theme.muted)) }
+                    })
+                    .collect();
+                let list = List::new(items)
+                    .block(
+                        Block::bordered()
+                            .style(theme.popup())
+                            .border_style(theme.fg(theme.accent))
+                            .title(format!(" Shell into which pod of {owner}? "))
+                            .title_bottom(Line::styled(" Enter shell · Esc cancel ", theme.fg(theme.muted))),
+                    )
+                    .highlight_style(theme.selected())
+                    .highlight_symbol("▶ ");
+                frame.render_widget(Clear, popup);
+                frame.render_stateful_widget(list, popup, &mut self.pod_pick_state);
+            }
             Mode::PortForwards => {
                 let popup = area.centered(Constraint::Length(70.min(area.width)), Constraint::Length(12));
                 let items: Vec<ListItem> = if self.port_forwards.is_empty() {
@@ -2410,7 +2528,7 @@ COMMAND PROMPT (:)
   !<cmd>                    runs on the real terminal (exec -it, edit, k9s...)
 RESOURCES
   ←/→ [ ]  kind     d describe   y yaml     v events     l logs -f   L previous logs
-  e exec shell      E edit       f port-forward          s scale     r restart
+  e shell (workloads: pick a pod)  E edit       f port-forward          s scale     r restart
   o rollout status  x delete
 HELM
   s status  v values  V all values  m manifest  N notes  h history  b rollback  x uninstall
@@ -2591,6 +2709,46 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
 
     fn draw(app: &mut App) -> String {
         draw_sized(app, 160, 40)
+    }
+
+    #[test]
+    fn shell_on_a_workload_finds_its_pods_and_asks_which_one() {
+        let (mut app, script) = loaded();
+        show(&mut app, "deployments", DEPLOYMENTS);
+        script.borrow_mut().replies = vec![
+            ("kubectl get deployments/web -o", Ok(r#"{"app":"web","tier":"front"}"#.into())),
+            (
+                "kubectl get pods -l app=web,tier=front -n shop",
+                Ok("NAME          READY   STATUS             RESTARTS   AGE\nweb-abc-111   0/1     CrashLoopBackOff   5          1d\nweb-abc-222   1/1     Running            0          1d\n".into()),
+            ),
+        ];
+        // Delivers the selector reply, then the pod list it asked for.
+        let deliver = |app: &mut App| {
+            for _ in 0..2 {
+                let messages: Vec<Msg> = app.rx.try_iter().collect();
+                messages.into_iter().for_each(|msg| app.handle_msg(msg));
+            }
+        };
+        press(&mut app, KeyCode::Char('e'));
+        deliver(&mut app);
+        assert!(script.borrow().commands.iter().any(|c| c == "capture: kubectl get deployments/web -o 'jsonpath={.spec.selector.matchLabels}' -n shop"));
+        assert!(matches!(&app.mode, Mode::PickPod { pods, .. } if pods.len() == 2));
+        let screen = draw(&mut app);
+        assert!(screen.contains("Shell into which pod of deployments/web?") && screen.contains("▶ web-abc-222"), "{screen}");
+
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        let job = app.pending_interactive.take().unwrap();
+        assert_eq!(job.argv[..6], ["kubectl", "exec", "-it", "web-abc-111", "-n", "shop"]);
+
+        // A single pod is entered right away; a pod's own `e` never asks.
+        script.borrow_mut().replies[1].1 = Ok("NAME          READY   STATUS    RESTARTS   AGE\nweb-abc-222   1/1     Running   0          1d\n".into());
+        press(&mut app, KeyCode::Char('e'));
+        deliver(&mut app);
+        assert_eq!(app.pending_interactive.take().unwrap().argv[3], "web-abc-222");
+        show(&mut app, "pods", PODS);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.pending_interactive.take().unwrap().argv[3], "web-1");
     }
 
     #[test]
@@ -3000,7 +3158,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         assert_eq!(last(&script), "stream: kubectl rollout status -w deployments/web -n shop");
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('e'));
-        assert_eq!(status(&app), "✘ exec is not available for deployments");
+        assert_eq!(status(&app), "$ kubectl get deployments/web -o 'jsonpath={.spec.selector.matchLabels}' -n shop");
         press(&mut app, KeyCode::Char('L'));
 
         press(&mut app, KeyCode::Char('s'));

@@ -15,6 +15,9 @@ pub enum Target {
     Action,
     /// A Tooling row's installed version, or with `latest` its newest release.
     Tooling { row: usize, latest: bool },
+    /// `e` on a workload: its pod selector, then its pods (lookup id).
+    PodSelector(u64),
+    PodList(u64),
 }
 
 /// Messages sent from background command threads to the UI loop.
