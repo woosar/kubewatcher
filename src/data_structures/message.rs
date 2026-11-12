@@ -7,6 +7,15 @@ pub enum Target {
     Resources(u64),
     Helm(u64),
     Flux(u64),
+    /// The periodic `flux get all -A` behind the banner.
+    FluxHealth,
+    /// Which Helm releases Flux manages, and where their records are stored.
+    HelmStorage,
+    /// `f` on a Flux object: what it refers to (lookup id).
+    FluxChain(u64),
+    /// The `flux suspend` that starts an experiment, and the `flux resume` that ends it.
+    ExperimentStarted,
+    ExperimentEnded,
     /// Output for the viewer opened with this generation id.
     Viewer(u64),
     /// `kubectl get ... -o name` for prompt completion.

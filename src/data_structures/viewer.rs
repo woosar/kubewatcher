@@ -1,4 +1,5 @@
-use std::process::Child;
+use std::process::{Child, ExitStatus};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -14,6 +15,8 @@ use crate::helpers;
 /// Keep streaming output bounded so `logs -f` can run for hours.
 const MAX_LINES: usize = 20_000;
 pub const DEFAULT_WATCH: Duration = Duration::from_secs(2);
+const EXIT_WAIT_TRIES: usize = 20;
+const EXIT_WAIT_STEP: Duration = Duration::from_millis(10);
 
 pub enum ViewerAction {
     None,
@@ -98,9 +101,33 @@ impl Viewer {
         }
     }
 
-    pub fn end_stream(&mut self) {
+    /// Its output has ended; how the command itself ended is what the journal should record.
+    pub fn end_stream(&mut self) -> Result<(), String> {
         self.stream_ended = true;
-        self.push_line("── stream ended ──");
+        let outcome = self.exit_status().map_or(Ok(()), |status| {
+            // `flux diff` exits 1 to say "there are differences", which is an answer, not a failure.
+            let found_differences = self.argv.starts_with(&["flux".to_string(), "diff".to_string()]) && status.code() == Some(1);
+            if found_differences { Ok(()) } else { helpers::exit_outcome(&self.argv, Ok(status)) }
+        });
+        match &outcome {
+            Ok(()) => self.push_line("── stream ended ──"),
+            Err(e) => self.push_line(&format!("── failed: {e} ──")),
+        }
+        outcome
+    }
+
+    /// Output closes just before the process is gone, so it gets a moment; anything that keeps
+    /// running after closing its output isn't waited for, as this runs on the UI thread.
+    fn exit_status(&mut self) -> Option<ExitStatus> {
+        let child = self.stream.as_mut()?;
+        for _ in 0..EXIT_WAIT_TRIES {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => thread::sleep(EXIT_WAIT_STEP),
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ViewerAction {
@@ -286,8 +313,25 @@ mod tests {
         assert!(matches!(press(&mut viewer, KeyCode::Char('r')), ViewerAction::None));
         press(&mut viewer, KeyCode::Char('w'));
         assert!(viewer.watch.is_none());
-        viewer.end_stream();
+        assert!(viewer.end_stream().is_ok());
         assert_eq!(viewer.lines.last().map(String::as_str), Some("── stream ended ──"));
         // Dropping the viewer kills the still-running process.
+    }
+
+    #[test]
+    fn how_a_stream_ended_comes_from_its_exit_status() {
+        let ended = |argv: &[&str], script: &str| {
+            let mut viewer = Viewer::new("t".into(), helpers::argv(argv), 1);
+            viewer.attach_stream(helpers::spawn_background(&helpers::shell(script)).unwrap());
+            (viewer.end_stream(), viewer.lines.last().cloned().unwrap_or_default())
+        };
+        assert_eq!(ended(&["flux", "reconcile"], "exit 0").0, Ok(()));
+
+        let (outcome, line) = ended(&["flux", "reconcile"], "exit 3");
+        assert!(outcome.is_err() && line.starts_with("── failed:"), "{line}");
+
+        // Differences found is an answer; anything else from flux diff is still a failure.
+        assert_eq!(ended(&["flux", "diff", "kustomization", "a"], "exit 1").0, Ok(()));
+        assert!(ended(&["flux", "diff", "kustomization", "a"], "exit 2").0.is_err());
     }
 }

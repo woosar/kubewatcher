@@ -161,10 +161,13 @@ impl Journal {
         if entry.outcome.is_some() {
             return;
         }
+        // The summary is written to disk, and final values can hold secrets.
+        let hidden = ok && ["--show-values", "--show-vars"].iter().any(|flag| entry.command.contains(flag));
         let summary: String = output
             .lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
+            .map(|l| if hidden { "(values shown, not logged)" } else { l })
             .unwrap_or("")
             .chars()
             .take(160)
@@ -189,6 +192,20 @@ impl Journal {
         if let Some((day, text)) = line {
             self.append(day, &text);
         }
+    }
+
+    /// The id of the newest entry, to ask for `changes_since` later.
+    pub fn last_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Commands that changed something after entry `id`, oldest first; failed ones are left out.
+    pub fn changes_since(&self, id: u64) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.id > id && e.change && e.outcome.as_ref().is_none_or(|o| o.ok))
+            .map(|e| e.command.clone())
+            .collect()
     }
 
     /// Whether a command modifies the cluster or your kubeconfig.
@@ -424,6 +441,25 @@ mod tests {
         assert_eq!(outcome.summary, "Error from server (NotFound): pods \"x\" not found");
         assert!(j.entries[0].change);
         j.finish(999, true, "unknown ids are ignored");
+    }
+
+    #[test]
+    fn final_values_never_reach_the_log_and_changes_can_be_listed() {
+        let mut journal = Journal::open(None);
+        let debug = journal.record(&crate::helpers::argv(&["flux", "debug", "helmrelease", "web", "--show-values"]), "Flux", RunMode::Capture, false);
+        journal.finish(debug, true, "password: hunter2\n");
+        assert_eq!(journal.entries[0].outcome.as_ref().unwrap().summary, "(values shown, not logged)");
+
+        let mark = journal.last_id();
+        assert!(journal.changes_since(mark).is_empty());
+        let read = journal.record(&crate::helpers::argv(&["kubectl", "get", "pods"]), "x", RunMode::Capture, false);
+        journal.finish(read, true, "");
+        let failed = journal.record(&crate::helpers::argv(&["kubectl", "delete", "pod", "a"]), "x", RunMode::Capture, false);
+        journal.finish(failed, false, "denied");
+        let scale = journal.record(&crate::helpers::argv(&["kubectl", "scale", "deploy/web", "--replicas=2"]), "x", RunMode::Capture, false);
+        journal.finish(scale, true, "scaled");
+        journal.record(&crate::helpers::argv(&["kubectl", "edit", "deploy/web"]), "x", RunMode::Interactive, false);
+        assert_eq!(journal.changes_since(mark), ["kubectl scale deploy/web --replicas=2", "kubectl edit deploy/web"]);
     }
 
     #[test]

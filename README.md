@@ -29,6 +29,7 @@ kubewatcher
   context that has a file of its own, and `S` splits files that hold several contexts (a backup is
   written first; `~/.kube/config` keeps only `current-context`, since kubectx/kubens write there).
 - **Contexts, namespaces, resources, Helm releases and Flux objects** in tabs, with filtering (`/`).
+- **Help with Flux, where GitOps gets confusing** (details [below](#flux)).
 - **Nothing hidden.** Pressing `r` on a Flux kustomization shows and runs
   `flux reconcile kustomization web -n apps --with-source`. Turning Flux off is
   `flux suspend kustomization --all -n apps`. You see it before it runs.
@@ -40,10 +41,39 @@ kubewatcher
 - **A command prompt (`:`) with Tab completion** for verbs, kinds and live resource names, plus the
   oh-my-zsh kubectl aliases (`kgp`, `klf`, `ked`, …). It shows the expansion as you type
   (`klf web` → `kubectl logs -f web`).
-- **A searchable cheatsheet (tab 7)** with about 110 commands for kubectl, helm and flux, each
+- **A searchable cheatsheet (tab 7)** with about 120 commands for kubectl, helm and flux, each
   explained in one line. Enter loads one into the prompt with your current namespace filled in.
 - **Live logs, `watch`, port-forwards and rollout status** in a scrollable viewer.
 - **Themes** (`T`): default, Violet and Osaka Jade. Add your own in `~/.config/kubewatcher/themes/`.
+
+## Flux
+
+Flux keeps changing things after you've changed them, and its problems often show up far from their
+cause. The Flux tab (`4`) is built for that. Press `?` there for all its keys.
+
+- **See what's wrong first.** It opens on an overview of every Flux object, most urgent first (`a` shows
+  only problems). All Flux's kinds are listed too, and one whose controller your cluster doesn't run says
+  so instead of showing an error.
+- **A banner on every tab** names whatever is suspended or failing, so a paused object can't be forgotten.
+- **Who manages this?** `t` on any resource in the Resources tab runs `flux trace`: why does my change
+  keep coming back, and from where?
+- **Failures in plain language.** Common errors are explained under the list with the next command to
+  try; `p` loads it into the prompt, so you decide whether to run it.
+- **Experiment safely.** `X` suspends an object so you can change things live. `X` again lists what you
+  changed and what resuming will do to it, which differs per kind: a Kustomization overwrites your edits,
+  while a HelmRelease without `driftDetection` silently keeps them. It warns before you quit and refuses to
+  switch cluster while an experiment runs.
+- **Follow the chain.** `f` shows what an object depends on; Enter jumps there.
+- **Stuck HelmReleases.** `v` final values (never written to the journal), `h` history, `i` status, `Z`
+  reset the failure count, `F` force an upgrade.
+- **Helm and Flux together.** Flux can keep a release's Helm records in another namespace, where
+  plain `helm status` won't find it. The Helm tab looks in the right place, and warns before a rollback or
+  uninstall that Flux may undo.
+- **Create objects as YAML.** `c` builds a `flux create … --export` command. It only prints YAML or saves
+  it to a new file: nothing reaches the cluster until you commit it.
+- **Preview a push.** `D` runs `flux diff` of a Kustomization against a local folder.
+- **Controller health.** `K` shows the controllers' pods, `flux stats` and their recent errors. `C` runs
+  `flux check`.
 
 ## Requirements
 

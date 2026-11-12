@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,12 +16,18 @@ use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
 use crate::data_structures::{
-    COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, FormAction, Host, Journal, K3sForm, KubeTable, Machine, Msg, RunMode, Target,
-    Theme, Tool, ToolKind, Viewer, ViewerAction,
+    CHAIN_JSONPATH, COMPLETION_KINDS, Cheatsheet, Completer, ContextForm, Experiment, FLUX_KINDS, FluxChain, FluxDiagnosis, FluxForm,
+    FluxHealth, FluxKind, FormAction, Host, Journal, K3sForm, KubeTable, Machine, Msg, RunMode, Target, Theme, Tool, ToolKind, Viewer,
+    ViewerAction,
 };
 use crate::helpers::{self, argv};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the "Flux is paused" banner is brought up to date.
+const FLUX_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+/// Height of the panel under the Flux table, and the body height it needs to fit.
+const FLUX_DETAILS_HEIGHT: u16 = 8;
+const FLUX_DETAILS_MIN_BODY: u16 = 18;
 const ALL_NAMESPACES: &str = "(all namespaces)";
 const COMPLETION_TTL: Duration = Duration::from_secs(15);
 const JOURNAL_STRIP_HEIGHT: u16 = 7;
@@ -67,6 +73,21 @@ enum Prompt {
     Scale { target: String, namespace: Option<String> },
     PortForward { target: String, namespace: Option<String> },
     Rollback { release: String, namespace: Option<String> },
+    FluxDiff { name: String, namespace: Option<String> },
+    /// `CONTAINER=IMAGE` pairs for `kubectl set image`.
+    Image { target: String, namespace: Option<String> },
+    /// `KEY=VALUE` / `KEY-` for `kubectl set env`; `current` is what `--list` printed.
+    Env { target: String, namespace: Option<String>, current: Vec<String> },
+}
+
+/// How a confirmed command runs and where its result goes.
+enum AfterConfirm {
+    /// One-shot; the result goes to the status bar.
+    Action,
+    /// Streams in the viewer with this title, for commands with progress output.
+    Viewer(String),
+    StartExperiment(Experiment),
+    EndExperiment,
 }
 
 enum Mode {
@@ -74,8 +95,13 @@ enum Mode {
     Filter,
     Command,
     Prompt(Prompt),
-    Confirm { message: String, argv: Vec<String> },
+    Confirm { message: String, argv: Vec<String>, after: AfterConfirm },
     AddContext(ContextForm),
+    CreateFlux(FluxForm),
+    /// What the selected Flux object depends on; Enter jumps there.
+    FluxChain(FluxChain),
+    /// Asks how to finish the running experiment.
+    FinishExperiment,
     ImportK3s(K3sForm),
     /// Like Confirm, for changes kubewatcher makes itself (rc file, splitting kubeconfigs).
     ConfirmPlan { title: String, lines: Vec<String>, plan: Plan },
@@ -103,6 +129,10 @@ struct KubeconfigFile {
     path: PathBuf,
     contexts: Vec<String>,
     current: String,
+    /// Context name -> the cluster it points at.
+    context_clusters: BTreeMap<String, String>,
+    /// Cluster name -> its API server URL.
+    servers: BTreeMap<String, String>,
 }
 
 /// Leader-key bindings: Space + key opens a view.
@@ -175,79 +205,41 @@ const KINDS: &[ResourceKind] = &[
     ResourceKind { name: "storageclasses", namespaced: false, ..NAMESPACED },
 ];
 
-/// A Flux object type and how each flux CLI subcommand spells it.
-struct FluxKind {
-    label: &'static str,
-    /// `flux get <get...>`
-    get: &'static [&'static str],
-    /// `flux suspend|resume|reconcile <cli...> NAME`
-    cli: &'static [&'static str],
-    /// Full CRD name for kubectl describe / get -o yaml.
-    crd: &'static str,
-    /// Kind as used by `flux events --for` and `flux logs --kind`.
-    kind: &'static str,
-    /// reconcile supports --with-source (fetch git/chart first).
-    with_source: bool,
-    /// `flux tree` is supported.
-    tree: bool,
+/// The Flux object under the cursor, also when the overview mixes all kinds.
+struct FluxSelection {
+    kind: &'static FluxKind,
+    name: String,
+    namespace: Option<String>,
+    suspended: bool,
+    ready: String,
+    message: String,
 }
 
-const FLUX_KINDS: &[FluxKind] = &[
-    FluxKind {
-        label: "kustomizations",
-        get: &["kustomizations"],
-        cli: &["kustomization"],
-        crd: "kustomizations.kustomize.toolkit.fluxcd.io",
-        kind: "Kustomization",
-        with_source: true,
-        tree: true,
-    },
-    FluxKind {
-        label: "helmreleases",
-        get: &["helmreleases"],
-        cli: &["helmrelease"],
-        crd: "helmreleases.helm.toolkit.fluxcd.io",
-        kind: "HelmRelease",
-        with_source: true,
-        tree: false,
-    },
-    FluxKind {
-        label: "git sources",
-        get: &["sources", "git"],
-        cli: &["source", "git"],
-        crd: "gitrepositories.source.toolkit.fluxcd.io",
-        kind: "GitRepository",
-        with_source: false,
-        tree: false,
-    },
-    FluxKind {
-        label: "helm repositories",
-        get: &["sources", "helm"],
-        cli: &["source", "helm"],
-        crd: "helmrepositories.source.toolkit.fluxcd.io",
-        kind: "HelmRepository",
-        with_source: false,
-        tree: false,
-    },
-    FluxKind {
-        label: "oci sources",
-        get: &["sources", "oci"],
-        cli: &["source", "oci"],
-        crd: "ocirepositories.source.toolkit.fluxcd.io",
-        kind: "OCIRepository",
-        with_source: false,
-        tree: false,
-    },
-    FluxKind {
-        label: "helm charts",
-        get: &["sources", "chart"],
-        cli: &["source", "chart"],
-        crd: "helmcharts.source.toolkit.fluxcd.io",
-        kind: "HelmChart",
-        with_source: false,
-        tree: false,
-    },
-];
+impl FluxSelection {
+    /// What is going on with it in plain words, and the command worth running next.
+    fn advice(&self) -> Option<(String, String)> {
+        let namespace = self.namespace.as_deref();
+        if self.suspended {
+            let resume = format!("flux {} {} {}{}", "resume", self.kind.cli.join(" "), self.name, namespace.map(|ns| format!(" -n {ns}")).unwrap_or_default());
+            return Some(("Suspended: Flux ignores it until resumed, whatever the source says.".into(), resume));
+        }
+        if self.ready == "True" {
+            return None;
+        }
+        Some(match FluxDiagnosis::of(&self.message, self.kind, &self.name, namespace) {
+            Some(diagnosis) => (diagnosis.meaning.to_string(), diagnosis.next),
+            None => ("Not ready, for a reason kubewatcher doesn't recognize. Its events usually explain more.".into(), FluxDiagnosis::events(self.kind, &self.name, namespace)),
+        })
+    }
+}
+
+/// `f` on a Flux object: the object it asked about, until kubectl answers.
+struct ChainLookup {
+    request: u64,
+    kind: &'static str,
+    name: String,
+    namespace: String,
+}
 
 /// A `kubectl port-forward` running in the background for as long as the app runs.
 struct PortForward {
@@ -402,9 +394,29 @@ pub struct App {
 
     kind_index: usize,
     resources: TablePane,
+    /// Workload -> the last `set env` change, which the next `N` starts from.
+    last_env: BTreeMap<String, String>,
     helm: TablePane,
     flux_kind_index: usize,
     flux: TablePane,
+    /// (release, its namespace) → the namespace holding Helm's records of it, for releases Flux
+    /// manages. Helm needs that one for `-n`, and `helm list` doesn't say which it is.
+    helm_storage: BTreeMap<(String, String), String>,
+    /// From the last `flux get all -A`; None when that failed.
+    flux_health: Option<FluxHealth>,
+    flux_health_checked: Option<Instant>,
+    /// The overview hides what is healthy.
+    flux_problems_only: bool,
+    chain_lookup: Option<ChainLookup>,
+    next_chain_lookup: u64,
+    flux_chain_state: ListState,
+    /// The local checkout `D` last compared with.
+    flux_diff_path: String,
+    /// Waiting for its `flux suspend` to succeed.
+    pending_experiment: Option<Experiment>,
+    experiment: Option<Experiment>,
+    /// `q` warned once that quitting leaves the experiment suspended.
+    quit_warned: bool,
     cheatsheet: Cheatsheet,
     journal: Journal,
     show_journal_strip: bool,
@@ -473,9 +485,21 @@ impl App {
             namespace_filter: String::new(),
             kind_index: 0,
             resources: TablePane::default(),
+            last_env: BTreeMap::new(),
             helm: TablePane::default(),
             flux_kind_index: 0,
             flux: TablePane::default(),
+            helm_storage: BTreeMap::new(),
+            flux_health: None,
+            flux_health_checked: None,
+            flux_problems_only: false,
+            chain_lookup: None,
+            next_chain_lookup: 0,
+            flux_chain_state: ListState::default(),
+            flux_diff_path: String::new(),
+            pending_experiment: None,
+            experiment: None,
+            quit_warned: false,
             cheatsheet: Cheatsheet::new(),
             journal: Journal::open(journal_dir),
             show_journal_strip: true,
@@ -564,8 +588,10 @@ impl App {
             }
             Msg::StreamEnd { generation } => {
                 if let Some(viewer) = self.viewer.as_mut().filter(|v| v.generation == generation) {
-                    viewer.end_stream();
-                    self.journal.finish(viewer.journal, true, "stream ended");
+                    match viewer.end_stream() {
+                        Ok(()) => self.journal.finish(viewer.journal, true, "stream ended"),
+                        Err(e) => self.journal.finish(viewer.journal, false, &e),
+                    }
                 }
             }
         }
@@ -591,10 +617,54 @@ impl App {
                 self.completer.releases = Self::column_values(&self.helm.table, "NAME");
             }
             Target::Flux(id) if id == self.flux.request => {
-                self.flux.set_result(result.map(|t| KubeTable::parse(&t)));
-                self.completer.flux_names = Self::column_values(&self.flux.table, "NAME");
+                let kind = self.flux_kind();
+                let result = kind.list_result(result);
+                if kind.is_overview() {
+                    self.flux_health = result.as_ref().ok().map(|text| FluxHealth::parse(text));
+                    self.flux_health_checked = Some(Instant::now());
+                    let table = self.flux_health.as_ref().map(|h| h.table(self.flux_problems_only));
+                    self.flux.set_result(table.ok_or_else(|| result.err().unwrap_or_default()));
+                } else {
+                    self.flux.set_result(result.map(|t| KubeTable::parse(&t)));
+                }
+                // The overview's names are `kind/name`; commands want the name alone.
+                let names = Self::column_values(&self.flux.table, "NAME");
+                self.completer.flux_names = names.iter().map(|n| n.rsplit('/').next().unwrap_or(n).to_string()).collect();
             }
             Target::Resources(_) | Target::Helm(_) | Target::Flux(_) => {}
+            Target::FluxHealth => {
+                self.flux_health = result.ok().map(|text| FluxHealth::parse(&text));
+            }
+            // Fails on clusters without Flux, which simply means there is nothing to look up.
+            Target::HelmStorage => {
+                self.helm_storage = result.unwrap_or_default().lines().filter_map(Self::parse_helm_storage).collect();
+            }
+            Target::FluxChain(request) => self.on_flux_chain(request, result),
+            Target::ExperimentStarted => {
+                match result {
+                    Ok(_) => {
+                        self.experiment = self.pending_experiment.take();
+                        let label = self.experiment.as_ref().map(Experiment::label).unwrap_or_default();
+                        self.set_status(format!("✔ {label} is suspended. Change things and watch them stay; X in the Flux tab finishes"));
+                    }
+                    Err(e) => {
+                        self.pending_experiment = None;
+                        self.set_error(e);
+                    }
+                }
+                self.refresh_after_change();
+            }
+            Target::ExperimentEnded => {
+                match result {
+                    Ok(_) => {
+                        let label = self.experiment.take().map(|e| e.label()).unwrap_or_default();
+                        self.quit_warned = false;
+                        self.set_status(format!("✔ {label} resumed: Flux is in charge of it again"));
+                    }
+                    Err(e) => self.set_error(e),
+                }
+                self.refresh_after_change();
+            }
             Target::Completions => {
                 if let Ok(text) = result {
                     self.completer.set_resources(&text);
@@ -616,9 +686,24 @@ impl App {
                     }
                     Err(e) => self.set_error(e),
                 }
-                self.refresh_current(true);
+                self.refresh_after_change();
             }
         }
+    }
+
+    /// `release<TAB>its namespace<TAB>storage namespace`; a release not yet installed has blanks.
+    fn parse_helm_storage(line: &str) -> Option<((String, String), String)> {
+        let mut cells = line.split('\t').map(str::trim);
+        let (release, namespace, storage) = (cells.next()?, cells.next()?, cells.next()?);
+        (!release.is_empty() && !storage.is_empty()).then(|| ((release.to_string(), namespace.to_string()), storage.to_string()))
+    }
+
+    /// Whatever just changed may have changed what the banner should say.
+    fn refresh_after_change(&mut self) {
+        if !(self.tab == Tab::Flux && self.flux_kind().is_overview()) {
+            self.refresh_flux_health();
+        }
+        self.refresh_current(true);
     }
 
     fn on_contexts(&mut self, result: Result<String, String>) {
@@ -643,7 +728,11 @@ impl App {
             self.namespace_initialized = true;
             self.refresh_resources(false);
             self.refresh_helm(false);
+            self.refresh_helm_storage();
             self.refresh_flux(false);
+            if !self.flux_kind().is_overview() {
+                self.refresh_flux_health();
+            }
         }
     }
 
@@ -687,11 +776,21 @@ impl App {
             };
             let contexts = json.as_ref().map(names).unwrap_or_default();
             let current = json.as_ref().and_then(|j| j["current-context"].as_str()).unwrap_or_default().to_string();
+            // `[{name, <inner>: {<field>}}]` -> name -> field: contexts' clusters, clusters' servers.
+            let pairs = |list: &str, inner: &str, field: &str| -> BTreeMap<String, String> {
+                let items = json.as_ref().and_then(|j| j[list].as_array()).cloned().unwrap_or_default();
+                items
+                    .iter()
+                    .filter_map(|i| Some((i["name"].as_str()?.to_string(), i[inner][field].as_str()?.to_string())))
+                    .collect()
+            };
+            let context_clusters = pairs("contexts", "context", "cluster");
+            let servers = pairs("clusters", "cluster", "server");
             match &result {
                 Ok(_) => self.journal.finish(journal, true, &format!("{} context(s)", contexts.len())),
                 Err(e) => self.journal.finish(journal, false, e),
             }
-            self.kubeconfig.push(KubeconfigFile { path, contexts, current });
+            self.kubeconfig.push(KubeconfigFile { path, contexts, current, context_clusters, servers });
         }
     }
 
@@ -700,22 +799,34 @@ impl App {
         self.kubeconfig.iter().find(|f| f.contexts.iter().any(|c| c == context))
     }
 
+    /// The API server a context talks to; its cluster may sit in another file, as kubectl merges them.
+    fn server_of(&self, context: &str) -> Option<&str> {
+        let cluster = self.file_of(context)?.context_clusters.get(context)?;
+        self.kubeconfig.iter().find_map(|f| f.servers.get(cluster)).map(String::as_str)
+    }
+
+    /// Adds SERVER (where the context points) and FILE (where it is defined) to `get-contexts`.
     fn add_file_column(&self, table: &mut KubeTable) {
-        let Some(machine) = &self.machine else { return };
         if table.headers.is_empty() {
             return;
         }
-        let files: Vec<String> = table
+        let extra: Vec<(String, Option<String>)> = table
             .rows
             .iter()
             .map(|row| {
-                let file = table.cell(row, "NAME").and_then(|name| self.file_of(name));
-                file.map(|f| machine.display(&f.path)).unwrap_or_default()
+                let name = table.cell(row, "NAME").unwrap_or_default();
+                let server = self.server_of(name).unwrap_or_default().to_string();
+                let file = self.machine.as_ref().map(|m| self.file_of(name).map(|f| m.display(&f.path)).unwrap_or_default());
+                (server, file)
             })
             .collect();
-        table.headers.push("FILE".into());
-        for (row, file) in table.rows.iter_mut().zip(files) {
-            row.push(file);
+        table.headers.push("SERVER".into());
+        if self.machine.is_some() {
+            table.headers.push("FILE".into());
+        }
+        for (row, (server, file)) in table.rows.iter_mut().zip(extra) {
+            row.push(server);
+            row.extend(file);
         }
     }
 
@@ -752,6 +863,11 @@ impl App {
                 Tab::Contexts if self.contexts.watch_due() => self.refresh_contexts(true),
                 _ => {}
             }
+        }
+        // Keeps the banner true while you work elsewhere, or if someone else suspends something.
+        if !self.locked && self.namespace_initialized && self.flux_health_checked.is_none_or(|t| t.elapsed() >= FLUX_HEALTH_INTERVAL) {
+            self.refresh_helm_storage();
+            self.refresh_flux_health();
         }
 
         let mut exited = Vec::new();
@@ -835,7 +951,8 @@ impl App {
     }
 
     fn refresh_helm(&mut self, auto: bool) {
-        let mut argv = argv(&["helm", "list", "--all", "-o", "json"]);
+        // Spelled out: Helm 4 removed --all, and pending is what a stuck upgrade looks like.
+        let mut argv = argv(&["helm", "list", "--deployed", "--failed", "--pending", "-o", "json"]);
         argv.extend(self.scope_args());
         self.helm.request += 1;
         self.helm.loading = true;
@@ -847,6 +964,10 @@ impl App {
     /// Flux objects usually live in flux-system, so this view is always cluster-wide.
     fn refresh_flux(&mut self, auto: bool) {
         let kind = self.flux_kind();
+        // The overview's list is also what the banner reads.
+        if kind.is_overview() {
+            self.flux_health_checked = Some(Instant::now());
+        }
         let mut argv = argv(&["flux", "get"]);
         argv.extend(kind.get.iter().map(|s| s.to_string()));
         argv.push("-A".into());
@@ -855,6 +976,18 @@ impl App {
         self.flux.command = helpers::shell_join(&argv);
         let target = Target::Flux(self.flux.request);
         self.capture(argv, target, &format!("Flux ▸ list {}", kind.label), auto);
+    }
+
+    /// Only names and namespaces: the rest of a HelmRelease can hold secret values.
+    fn refresh_helm_storage(&mut self) {
+        let fields = r#"jsonpath={range .items[*]}{.status.history[0].name}{"\t"}{.status.history[0].namespace}{"\t"}{.status.storageNamespace}{"\n"}{end}"#;
+        let argv = argv(&["kubectl", "get", "helmreleases.helm.toolkit.fluxcd.io", "-A", "-o", fields]);
+        self.capture(argv, Target::HelmStorage, "Helm ▸ which releases Flux manages", true);
+    }
+
+    fn refresh_flux_health(&mut self) {
+        self.flux_health_checked = Some(Instant::now());
+        self.capture(argv(&["flux", "get", "all", "-A"]), Target::FluxHealth, "Flux ▸ what is suspended or failing", true);
     }
 
     /// Re-checks what is installed and reads the versions in the background. The newest
@@ -902,7 +1035,11 @@ impl App {
 
     /// Shows the exact command and asks before running it. `e` loads it into the prompt instead.
     fn confirm(&mut self, message: String, argv: Vec<String>) {
-        self.mode = Mode::Confirm { message, argv };
+        self.confirm_then(message, argv, AfterConfirm::Action);
+    }
+
+    fn confirm_then(&mut self, message: String, argv: Vec<String>, after: AfterConfirm) {
+        self.mode = Mode::Confirm { message, argv, after };
     }
 
     fn open_viewer(&mut self, title: String, argv: Vec<String>, stream: bool, watch: Option<Duration>) {
@@ -1020,15 +1157,31 @@ impl App {
             Mode::Filter => self.handle_filter_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Prompt(prompt) => self.handle_prompt_key(key, prompt),
-            Mode::Confirm { message, argv } => match key.code {
+            Mode::Confirm { message, argv, after } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     let origin = format!("{} ▸ {}", self.tab.name(), message.trim_end_matches('?'));
-                    self.run_action(argv, &origin);
+                    match after {
+                        AfterConfirm::Action => self.run_action(argv, &origin),
+                        AfterConfirm::Viewer(title) => self.open_viewer(title, argv, true, None),
+                        AfterConfirm::StartExperiment(mut experiment) => {
+                            self.set_status(format!("$ {}", helpers::shell_join(&argv)));
+                            self.capture(argv, Target::ExperimentStarted, &origin, false);
+                            experiment.journal_mark = self.journal.last_id();
+                            self.pending_experiment = Some(experiment);
+                        }
+                        AfterConfirm::EndExperiment => {
+                            self.set_status(format!("$ {}", helpers::shell_join(&argv)));
+                            self.capture(argv, Target::ExperimentEnded, &origin, false);
+                        }
+                    }
                 }
                 KeyCode::Char('e') => self.open_command(helpers::shell_join(&argv)),
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => self.set_status("cancelled".into()),
-                _ => self.mode = Mode::Confirm { message, argv },
+                _ => self.mode = Mode::Confirm { message, argv, after },
             },
+            Mode::CreateFlux(form) => self.handle_flux_form_key(key, form),
+            Mode::FluxChain(chain) => self.handle_flux_chain_key(key, chain),
+            Mode::FinishExperiment => self.handle_finish_experiment_key(key),
             Mode::AddContext(form) => self.handle_add_context_key(key, form),
             Mode::ImportK3s(form) => self.handle_import_k3s_key(key, form),
             Mode::ConfirmPlan { title, lines, plan } => match key.code {
@@ -1123,7 +1276,13 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('q') => match self.experiment.as_ref().filter(|_| !self.quit_warned).map(Experiment::label) {
+                Some(label) => {
+                    self.quit_warned = true;
+                    self.set_error(format!("{label} is still suspended from your experiment: X in the Flux tab finishes it. q again quits and leaves it suspended"));
+                }
+                None => self.running = false,
+            },
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char(' ') => self.mode = Mode::Leader,
             KeyCode::Char(':') => self.open_command(String::new()),
@@ -1178,12 +1337,18 @@ impl App {
                     return;
                 };
                 let name = name.to_string();
+                // Its `flux resume` would otherwise run against the wrong cluster.
+                if let Some(experiment) = self.experiment.as_ref().filter(|_| name != self.current_context) {
+                    let label = experiment.label();
+                    return self.set_error(format!("{label} is suspended on this cluster: finish the experiment first (X in the Flux tab)"));
+                }
                 let argv = argv(&["kubectl", "config", "use-context", &name]);
                 // The refresh after the switch re-reads the new context's namespace.
                 self.namespace_initialized = false;
                 self.resources.reset();
                 self.helm.reset();
                 self.flux.reset();
+                self.flux_health = None;
                 self.run_action(argv, &format!("Contexts ▸ switch to {name}"));
             }
             KeyCode::Char('i') => {
@@ -1605,6 +1770,41 @@ impl App {
         self.mode = Mode::PickPod { owner, namespace, pods };
     }
 
+    /// Runs a quick read synchronously, journaled; errors go to the status bar.
+    fn run_recorded(&mut self, argv: &[String], origin: &str) -> Option<String> {
+        let journal = self.journal.record(argv, origin, RunMode::Capture, false);
+        match self.host.run(argv) {
+            Ok(text) => {
+                self.journal.finish(journal, true, "ok");
+                Some(text)
+            }
+            Err(e) => {
+                self.journal.finish(journal, false, &e);
+                self.set_error(e);
+                None
+            }
+        }
+    }
+
+    /// Flips every container between `Always` and `IfNotPresent` (all `Always` -> `IfNotPresent`).
+    /// Changing the pod template rolls the workload out, so `Always` re-pulls a moved tag.
+    fn toggle_pull_policy(&mut self, target: &str, ns: &Option<String>) {
+        let jsonpath = "jsonpath={.spec.template.spec.containers[*].imagePullPolicy}";
+        let read = Self::with_namespace(argv(&["kubectl", "get", target, "-o", jsonpath]), ns);
+        let Some(text) = self.run_recorded(&read, &format!("Resources ▸ imagePullPolicy of {target}")) else { return };
+        let policies: Vec<&str> = text.split_whitespace().collect();
+        if policies.is_empty() {
+            return self.set_error(format!("{target} has no containers"));
+        }
+        let next = if policies.iter().all(|p| *p == "Always") { "IfNotPresent" } else { "Always" };
+        let ops: Vec<String> = (0..policies.len())
+            .map(|i| format!(r#"{{"op":"replace","path":"/spec/template/spec/containers/{i}/imagePullPolicy","value":"{next}"}}"#))
+            .collect();
+        let patch = format!("[{}]", ops.join(","));
+        let argv = Self::with_namespace(argv(&["kubectl", "patch", target, "--type=json", "-p", &patch]), ns);
+        self.run_action(argv, &format!("Resources ▸ imagePullPolicy of {target}: {} -> {next}", policies.join(",")));
+    }
+
     fn handle_resources_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Left | KeyCode::Char('[') => return self.select_kind(-1),
@@ -1666,10 +1866,35 @@ impl App {
                 let argv = Self::with_namespace(argv(&["kubectl", "rollout", "restart", &target]), &ns);
                 self.confirm(format!("Rollout restart {target}?"), argv);
             }
+            KeyCode::Char('i') if kind.restart => {
+                // CONTAINERS "web,sidecar" + IMAGES "nginx:1.25,busybox" -> "web=nginx:1.25 sidecar=busybox"
+                let row = self.resources.selected_row().unwrap_or_default();
+                let table = &self.resources.table;
+                let split = |column: &str| table.cell(row, column).unwrap_or_default().split(',').map(String::from).collect::<Vec<_>>();
+                let pairs: Vec<String> = split("CONTAINERS").iter().zip(split("IMAGES")).map(|(c, i)| format!("{c}={i}")).collect();
+                self.input = pairs.join(" ");
+                self.mode = Mode::Prompt(Prompt::Image { target, namespace: ns });
+            }
+            KeyCode::Char('N') if kind.restart => {
+                let list = Self::with_namespace(argv(&["kubectl", "set", "env", &target, "--list"]), &ns);
+                let Some(text) = self.run_recorded(&list, &format!("Resources ▸ env of {target}")) else { return };
+                let current = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).map(String::from).collect();
+                // Fiddling means changing the same thing again: start from the last change.
+                self.input = self.last_env.get(&target).cloned().unwrap_or_default();
+                self.mode = Mode::Prompt(Prompt::Env { target, namespace: ns, current });
+            }
+            KeyCode::Char('p') if kind.restart => self.toggle_pull_policy(&target, &ns),
             KeyCode::Char('o') if kind.restart => {
                 let argv = Self::with_namespace(argv(&["kubectl", "rollout", "status", "-w", &target]), &ns);
                 self.open_viewer(format!("rollout status {target}"), argv, true, None);
             }
+            // Who manages this? Answers "why does my change keep coming back?" Streamed, as flux
+            // prints "object not managed by Flux" on stderr and exits 0: that answer must show.
+            KeyCode::Char('t') if kind.name != "events" => {
+                let argv = Self::with_namespace(argv(&["flux", "trace", &target]), &ns);
+                self.open_viewer(format!("who manages {target}"), argv, true, None);
+            }
+            KeyCode::Char('t') => unsupported(self, "flux trace"),
             KeyCode::Char('s') if kind.scale => {
                 // READY "2/3" -> prefill desired replicas "3"
                 let row = self.resources.selected_row().unwrap_or_default();
@@ -1690,6 +1915,9 @@ impl App {
             KeyCode::Char('l') => unsupported(self, "logs"),
             KeyCode::Char('e') => unsupported(self, "exec"),
             KeyCode::Char('r') | KeyCode::Char('o') => unsupported(self, "rollout"),
+            KeyCode::Char('i') => unsupported(self, "set image"),
+            KeyCode::Char('N') => unsupported(self, "set env"),
+            KeyCode::Char('p') => unsupported(self, "imagePullPolicy"),
             KeyCode::Char('s') if kind.name == "pods" => self.set_error(
                 "pods aren't scaled directly: scale the Deployment/StatefulSet that owns them (Space d, select it, s)".into(),
             ),
@@ -1711,9 +1939,110 @@ impl App {
     fn select_flux_kind(&mut self, delta: isize) {
         let next = helpers::step_selection(Some(self.flux_kind_index), FLUX_KINDS.len(), delta).unwrap_or(0);
         if next != self.flux_kind_index {
-            self.flux_kind_index = next;
-            self.flux.reset();
-            self.refresh_flux(false);
+            self.show_flux_kind(next);
+        }
+    }
+
+    fn show_flux_kind(&mut self, index: usize) {
+        self.flux_kind_index = index;
+        self.flux.reset();
+        self.flux.filter.clear();
+        self.refresh_flux(false);
+    }
+
+    /// `kubectl get … -o jsonpath`, for just the references the object holds.
+    fn look_up_chain(&mut self, kind: &'static FluxKind, name: String, namespace: Option<String>) {
+        self.next_chain_lookup += 1;
+        let request = self.next_chain_lookup;
+        let argv = Self::with_namespace(argv(&["kubectl", "get", kind.crd, &name, "-o", CHAIN_JSONPATH]), &namespace);
+        self.set_status(format!("$ {}", helpers::shell_join(&argv)));
+        self.capture(argv, Target::FluxChain(request), &format!("Flux ▸ what {} {name} depends on", kind.kind), false);
+        self.chain_lookup = Some(ChainLookup { request, kind: kind.kind, name, namespace: namespace.unwrap_or_default() });
+    }
+
+    fn on_flux_chain(&mut self, request: u64, result: Result<String, String>) {
+        let Some(lookup) = self.chain_lookup.take_if(|l| l.request == request) else { return };
+        match result {
+            Err(e) => self.set_error(e),
+            Ok(text) => {
+                let chain = FluxChain::parse(&text, lookup.kind, &lookup.name, &lookup.namespace);
+                if chain.links.is_empty() {
+                    return self.set_status(format!("{} depends on nothing: it is where the chain starts", chain.owner));
+                }
+                self.status = None;
+                self.flux_chain_state.select(Some(0));
+                self.mode = Mode::FluxChain(chain);
+            }
+        }
+    }
+
+    fn handle_flux_chain_key(&mut self, key: KeyEvent, chain: FluxChain) {
+        let selected = self.flux_chain_state.selected();
+        let len = chain.links.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') => self.flux_chain_state.select(helpers::step_selection(selected, len, 1)),
+            KeyCode::Up | KeyCode::Char('k') => self.flux_chain_state.select(helpers::step_selection(selected, len, -1)),
+            KeyCode::Enter => {
+                let Some(link) = selected.and_then(|i| chain.links.get(i)) else { return };
+                match FluxKind::index_of(&link.kind) {
+                    Some(index) => {
+                        self.show_flux_kind(index);
+                        self.flux.filter = link.name.clone();
+                    }
+                    None => self.set_error(format!("kubewatcher has no list for {} objects", link.kind)),
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::FluxChain(chain);
+    }
+
+    fn handle_flux_form_key(&mut self, key: KeyEvent, mut form: FluxForm) {
+        match form.handle_key(key) {
+            FormAction::Cancel => return self.set_status("cancelled".into()),
+            FormAction::None => {}
+            FormAction::Submit => match form.command() {
+                Err(e) => self.set_error(e),
+                Ok(command) => match form.save_path() {
+                    None => return self.open_viewer(format!("YAML for this {}", form.title()), command, false, None),
+                    Some(path) => {
+                        // Written with `>`, so it must not replace a file you already have.
+                        let on_disk = match (path.strip_prefix("~/"), &self.machine) {
+                            (Some(rest), Some(machine)) => machine.home.join(rest),
+                            _ => PathBuf::from(path),
+                        };
+                        if on_disk.exists() {
+                            self.set_error(format!("{path} already exists; choose another name or delete it first"));
+                        } else {
+                            let target = helpers::shell_join(&[path.to_string()]);
+                            let line = format!("{} > {target}", helpers::shell_join(&command));
+                            return self.confirm(format!("Write this {} to {path}?", form.title()), helpers::shell(&line));
+                        }
+                    }
+                },
+            },
+        }
+        self.mode = Mode::CreateFlux(form);
+    }
+
+    fn handle_finish_experiment_key(&mut self, key: KeyEvent) {
+        let Some(experiment) = &self.experiment else { return };
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Enter => {
+                let message = format!("Resume {}? Flux takes charge of it again", experiment.label());
+                let argv = experiment.resume_command();
+                self.confirm_then(message, argv, AfterConfirm::EndExperiment);
+            }
+            KeyCode::Char('k') => {
+                let label = experiment.label();
+                self.experiment = None;
+                self.quit_warned = false;
+                self.set_status(format!("{label} stays suspended; the banner keeps showing it until someone resumes it"));
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {}
+            _ => self.mode = Mode::FinishExperiment,
         }
     }
 
@@ -1723,7 +2052,11 @@ impl App {
         };
         let table = &self.helm.table;
         let release = table.cell(row, "NAME").unwrap_or_default().to_string();
-        let ns = table.cell(row, "NAMESPACE").map(String::from).or_else(|| self.namespace.clone());
+        let release_ns = table.cell(row, "NAMESPACE").map(String::from);
+        let storage = release_ns.clone().and_then(|ns| self.helm_storage.get(&(release.clone(), ns))).cloned();
+        let managed = storage.is_some();
+        // Helm's `-n` means where its records are, which Flux can keep elsewhere.
+        let ns = storage.or(release_ns).or_else(|| self.namespace.clone());
         let revision: u32 = table.cell(row, "REVISION").and_then(|r| r.parse().ok()).unwrap_or(1);
 
         let view = |app: &mut Self, title: &str, parts: &[&str]| {
@@ -1739,14 +2072,44 @@ impl App {
             KeyCode::Char('h') => view(self, "history", &["helm", "history", &release]),
             KeyCode::Char('b') => {
                 self.input = revision.saturating_sub(1).max(1).to_string();
+                if managed {
+                    self.set_error(format!("Flux manages {release}: its next upgrade replaces a rollback. For a lasting one, change the chart or values in its source"));
+                }
                 self.mode = Mode::Prompt(Prompt::Rollback { release, namespace: ns });
             }
             KeyCode::Char('x') | KeyCode::Delete => {
                 let argv = Self::with_namespace(argv(&["helm", "uninstall", &release]), &ns);
-                self.confirm(format!("Uninstall helm release {release}?"), argv);
+                let message = if managed {
+                    format!("Uninstall helm release {release}? Flux manages it and can reinstall it: to really remove it, delete its HelmRelease from the source")
+                } else {
+                    format!("Uninstall helm release {release}?")
+                };
+                self.confirm(message, argv);
             }
             _ => {}
         }
+    }
+
+    /// The object under the cursor; on the overview its kind comes from the `kind/name` column.
+    fn flux_selection(&self) -> Option<FluxSelection> {
+        let row = self.flux.selected_row()?;
+        let table = &self.flux.table;
+        let listed = table.cell(row, "NAME")?;
+        let (kind, name) = match self.flux_kind() {
+            overview if overview.is_overview() => {
+                let (prefix, name) = listed.split_once('/')?;
+                (FluxKind::by_resource(prefix)?, name)
+            }
+            kind => (kind, listed),
+        };
+        Some(FluxSelection {
+            kind,
+            name: name.to_string(),
+            namespace: table.cell(row, "NAMESPACE").map(String::from),
+            suspended: table.cell(row, "SUSPENDED") == Some("True"),
+            ready: table.cell(row, "READY").unwrap_or_default().to_string(),
+            message: table.cell(row, "MESSAGE").unwrap_or_default().to_string(),
+        })
     }
 
     fn handle_flux_key(&mut self, key: KeyEvent) {
@@ -1756,6 +2119,29 @@ impl App {
             KeyCode::Right | KeyCode::Char(']') => return self.select_flux_kind(1),
             KeyCode::Char('C') => {
                 return self.open_viewer("flux check".into(), argv(&["flux", "check"]), false, None);
+            }
+            // Streams, as each part must show even if another fails.
+            KeyCode::Char('K') => {
+                let line = "kubectl get pods -n flux-system; echo; flux stats -A; echo; flux logs -A --level=error --tail=30";
+                return self.open_viewer("Flux controllers".into(), helpers::shell(line), true, None);
+            }
+            KeyCode::Char('c') => {
+                self.mode = Mode::CreateFlux(FluxForm::default());
+                return;
+            }
+            KeyCode::Char('X') if self.experiment.is_some() => {
+                self.mode = Mode::FinishExperiment;
+                return;
+            }
+            KeyCode::Char('a') if kind.is_overview() => {
+                self.flux_problems_only = !self.flux_problems_only;
+                if let Some(table) = self.flux_health.as_ref().map(|h| h.table(self.flux_problems_only)) {
+                    self.flux.set_result(Ok(table));
+                }
+                return self.set_status(if self.flux_problems_only { "showing only what is failing or suspended" } else { "showing everything" }.into());
+            }
+            KeyCode::Char('S') | KeyCode::Char('U') if kind.is_overview() => {
+                return self.set_error("S and U act on one whole kind: pick it with ←/→ first".into());
             }
             // "Flux off/on" for this kind: one `--all` command per namespace that has objects.
             KeyCode::Char('S') | KeyCode::Char('U') => {
@@ -1778,15 +2164,21 @@ impl App {
             _ => {}
         }
 
-        let Some(row) = self.flux.selected_row() else {
+        let Some(selected) = self.flux_selection() else {
             if matches!(key.code, KeyCode::Char(_) | KeyCode::Enter) {
-                self.set_error(format!("no {} selected", kind.label));
+                let what = if kind.is_overview() { "Flux object" } else { kind.label };
+                self.set_error(format!("no {what} selected"));
             }
             return;
         };
-        let table = &self.flux.table;
-        let name = table.cell(row, "NAME").unwrap_or_default().to_string();
-        let ns = table.cell(row, "NAMESPACE").map(String::from);
+        let suggestion = selected.advice().map(|(_, next)| next);
+        let FluxSelection { kind, name, namespace: ns, .. } = selected;
+        let debug_kind = match kind.kind {
+            "HelmRelease" => Some("helmrelease"),
+            "Kustomization" => Some("kustomization"),
+            _ => None,
+        };
+        let is_release = kind.kind == "HelmRelease";
         let object = |verb: &str| {
             let mut parts = vec!["flux", verb];
             parts.extend(kind.cli);
@@ -1803,13 +2195,58 @@ impl App {
                 let argv = Self::with_namespace(argv(&["kubectl", "get", kind.crd, &name, "-o", "yaml"]), &ns);
                 self.open_viewer(format!("yaml {} {name}", kind.kind), argv, false, None);
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if kind.reconcile => {
                 let mut argv = object("reconcile");
                 if kind.with_source {
                     argv.push("--with-source".into());
                 }
+                let message = format!("Reconcile {} {name} now? Flux applies the newest source, which can change what is running", kind.kind);
                 // Streams so you can watch flux's own progress output.
-                self.open_viewer(format!("reconcile {} {name}", kind.kind), argv, true, None);
+                self.confirm_then(message, argv, AfterConfirm::Viewer(format!("reconcile {} {name}", kind.kind)));
+            }
+            KeyCode::Char('r') => self.set_error(format!("flux has no reconcile for {} objects: they act on events", kind.kind)),
+            // Recovering a release that Helm has given up on.
+            KeyCode::Char('Z') if is_release => {
+                let mut argv = object("reconcile");
+                argv.push("--reset".into());
+                let message = format!("Reset the failure count of {name}? Helm retries it from the start");
+                self.confirm_then(message, argv, AfterConfirm::Viewer(format!("reset {name}")));
+            }
+            KeyCode::Char('F') if is_release => {
+                let mut argv = object("reconcile");
+                argv.push("--force".into());
+                let message = format!("Force an install or upgrade of {name}, even if nothing changed? Its pods may restart");
+                self.confirm_then(message, argv, AfterConfirm::Viewer(format!("force {name}")));
+            }
+            KeyCode::Char('Z') | KeyCode::Char('F') => self.set_error("--reset and --force only exist for HelmReleases".into()),
+            KeyCode::Char('v') | KeyCode::Char('h') | KeyCode::Char('i') => {
+                let Some(debug_kind) = debug_kind else {
+                    return self.set_error("flux debug only works for HelmReleases and Kustomizations".into());
+                };
+                let flag = match key.code {
+                    KeyCode::Char('h') => "--show-history",
+                    KeyCode::Char('i') => "--show-status",
+                    _ if is_release => "--show-values",
+                    _ => "--show-vars",
+                };
+                let argv = Self::with_namespace(argv(&["flux", "debug", debug_kind, &name, flag]), &ns);
+                self.open_viewer(format!("{name} {}", flag.trim_start_matches("--show-")), argv, false, None);
+            }
+            KeyCode::Char('f') => self.look_up_chain(kind, name, ns),
+            KeyCode::Char('p') => match suggestion {
+                Some(command) => self.open_command(command),
+                None => self.set_status(format!("{name} is healthy: nothing to suggest")),
+            },
+            KeyCode::Char('D') if kind.kind == "Kustomization" => {
+                self.input = self.flux_diff_path.clone();
+                self.mode = Mode::Prompt(Prompt::FluxDiff { name, namespace: ns });
+            }
+            KeyCode::Char('D') => self.set_error("flux diff only works for Kustomizations".into()),
+            KeyCode::Char('X') => {
+                let experiment = Experiment::new(kind, name, ns);
+                let message = format!("Start an experiment on {}? Flux stops managing it until you finish", experiment.label());
+                let argv = experiment.suspend_command();
+                self.confirm_then(message, argv, AfterConfirm::StartExperiment(experiment));
             }
             KeyCode::Char('s') => {
                 let message = format!("Suspend {} {name}? Flux stops applying git changes to it", kind.kind);
@@ -1940,7 +2377,12 @@ impl App {
 
     fn handle_prompt_key(&mut self, key: KeyEvent, prompt: Prompt) {
         match key.code {
-            KeyCode::Esc => return,
+            // Also clears a warning about this prompt, which no longer applies.
+            KeyCode::Esc => {
+                self.input.clear();
+                self.status = None;
+                return;
+            }
             KeyCode::Enter => {}
             _ => {
                 helpers::edit_input(&mut self.input, key);
@@ -1958,12 +2400,44 @@ impl App {
                 let argv = Self::with_namespace(argv(&["kubectl", "scale", &target, &replicas]), &namespace);
                 self.run_action(argv, &format!("Resources ▸ scale {target} to {value}"));
             }
+            Prompt::Image { target, namespace } => {
+                let pairs: Vec<&str> = value.split_whitespace().collect();
+                let valid = |p: &&str| p.split_once('=').is_some_and(|(c, i)| !c.is_empty() && !i.is_empty());
+                if pairs.is_empty() || !pairs.iter().all(valid) {
+                    return self.set_error(format!("'{value}' should look like CONTAINER=IMAGE:TAG, e.g. web=nginx:1.27"));
+                }
+                let mut command = argv(&["kubectl", "set", "image", &target]);
+                command.extend(pairs.iter().map(|p| p.to_string()));
+                self.run_action(Self::with_namespace(command, &namespace), &format!("Resources ▸ set image of {target}"));
+            }
+            Prompt::Env { target, namespace, .. } => {
+                // KEY=VALUE sets, KEY- removes; a value with spaces needs the : prompt.
+                let changes: Vec<&str> = value.split_whitespace().collect();
+                let valid = |c: &&str| c.split_once('=').is_some_and(|(k, _)| !k.is_empty()) || (c.len() > 1 && c.ends_with('-'));
+                if changes.is_empty() || !changes.iter().all(valid) {
+                    return self.set_error(format!("'{value}' should look like KEY=VALUE or KEY- (removes it)"));
+                }
+                let mut command = argv(&["kubectl", "set", "env", &target]);
+                command.extend(changes.iter().map(|c| c.to_string()));
+                self.last_env.insert(target.clone(), value.clone());
+                self.run_action(Self::with_namespace(command, &namespace), &format!("Resources ▸ set env of {target}"));
+            }
             Prompt::Rollback { release, namespace } => {
                 if value.parse::<u32>().is_err() {
                     return self.set_error(format!("'{value}' is not a revision"));
                 }
                 let argv = Self::with_namespace(argv(&["helm", "rollback", &release, &value]), &namespace);
                 self.run_action(argv, &format!("Helm ▸ roll back {release} to revision {value}"));
+            }
+            Prompt::FluxDiff { name, namespace } => {
+                if value.is_empty() {
+                    return self.set_error("enter the local path of the folder this Kustomization applies".into());
+                }
+                self.flux_diff_path = value.clone();
+                let path = format!("--path={value}");
+                let argv = Self::with_namespace(argv(&["flux", "diff", "kustomization", &name, &path, "--progress-bar=false"]), &namespace);
+                // Streams: flux exits 1 when there are differences, which is the useful answer.
+                self.open_viewer(format!("diff {name} ⇄ {value}"), argv, true, None);
             }
             Prompt::PortForward { target, namespace } => {
                 let valid = value.split(':').all(|p| p.parse::<u16>().is_ok()) && !value.is_empty();
@@ -2083,8 +2557,10 @@ impl App {
         } else {
             0
         };
-        let [header, body, strip, status, hints] = Layout::vertical([
+        let banner_line = self.flux_banner(&self.theme().clone());
+        let [header, banner, body, strip, status, hints] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(banner_line.is_some() as u16),
             Constraint::Fill(1),
             Constraint::Length(strip_height),
             Constraint::Length(1),
@@ -2095,6 +2571,9 @@ impl App {
         let theme = self.theme().clone();
         frame.render_widget(Block::new().style(theme.base()), frame.area());
         self.draw_header(frame, header, &theme);
+        if let Some(line) = banner_line {
+            frame.render_widget(Paragraph::new(line), banner);
+        }
         match self.tab {
             Tab::Contexts => {
                 let current = self.current_context.clone();
@@ -2117,7 +2596,21 @@ impl App {
                 });
             }
             Tab::Resources => self.draw_resources(frame, body, &theme),
-            Tab::Helm => self.helm.render(frame, body, " Helm releases".into(), &theme, |_| None),
+            Tab::Helm => {
+                // A release can be invisible in its own namespace, which looks like it is gone.
+                let storage: BTreeSet<&str> = self.helm_storage.values().map(String::as_str).collect();
+                let hidden = !storage.is_empty() && self.namespace.as_deref().is_some_and(|ns| !storage.contains(ns));
+                let note_height = u16::from(!storage.is_empty());
+                let [table, note] = Layout::vertical([Constraint::Fill(1), Constraint::Length(note_height)]).areas(body);
+                let list = storage.into_iter().collect::<Vec<_>>().join(", ");
+                let note_text = if hidden {
+                    format!(" Flux keeps its Helm records in {list}, so its releases don't show under this namespace: press n to pick it, or Space a for all")
+                } else {
+                    format!(" Flux keeps its Helm records in {list}. It may undo what you change here: the Flux tab is where to steer those releases")
+                };
+                self.helm.render(frame, table, " Helm releases".into(), &theme, |_| None);
+                frame.render_widget(Paragraph::new(note_text).style(theme.fg(theme.warning)), note);
+            }
             Tab::Flux => self.draw_flux(frame, body, &theme),
             Tab::Journal => self.journal.render(frame, body, &theme),
             Tab::Cheatsheet => self.cheatsheet.render(frame, body, &theme),
@@ -2131,6 +2624,29 @@ impl App {
         self.draw_status(frame, status, &theme);
         self.draw_hints(frame, hints, &theme);
         self.draw_popup(frame, body, &theme);
+    }
+
+    /// Shown on every tab: forgetting that Flux is paused is how clusters quietly drift from git.
+    fn flux_banner(&self, theme: &Theme) -> Option<Line<'static>> {
+        let list = |names: &[&str]| {
+            let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+            if names.len() > 3 { format!("{shown} +{} more", names.len() - 3) } else { shown }
+        };
+        let mut spans = Vec::new();
+        if let Some(experiment) = &self.experiment {
+            spans.push(Span::styled(format!(" ⚗ experiment: {} (X in the Flux tab finishes) ", experiment.label()), theme.badge(theme.secondary)));
+        }
+        if let Some(health) = &self.flux_health {
+            let suspended = health.suspended();
+            if !suspended.is_empty() {
+                spans.push(Span::styled(format!(" ⏸ Flux paused for {} ", list(&suspended)), theme.badge(theme.warning)));
+            }
+            let failing = health.failing();
+            if !failing.is_empty() {
+                spans.push(Span::styled(format!(" ✘ failing: {} ", list(&failing)), theme.badge(theme.danger)));
+            }
+        }
+        (!spans.is_empty()).then(|| Line::from(spans))
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -2192,12 +2708,39 @@ impl App {
         let [kinds_area, table_area] = Layout::horizontal([Constraint::Length(22), Constraint::Fill(1)]).areas(area);
         Self::draw_kind_list(frame, kinds_area, FLUX_KINDS.iter().map(|k| ListItem::new(k.label)), self.flux_kind_index, theme);
 
-        let title = format!(" Flux {} (all namespaces)", self.flux_kind().label);
+        let details = if table_area.height >= FLUX_DETAILS_MIN_BODY { FLUX_DETAILS_HEIGHT } else { 0 };
+        let [list_area, details_area] = Layout::vertical([Constraint::Fill(1), Constraint::Length(details)]).areas(table_area);
+
+        let problems = if self.flux_kind().is_overview() && self.flux_problems_only { ", problems only" } else { "" };
+        let title = format!(" Flux {} (all namespaces{problems})", self.flux_kind().label);
         let suspended = self.flux.table.column("SUSPENDED");
         let suspended_style = theme.fg(theme.warning).add_modifier(Modifier::DIM);
-        self.flux.render(frame, table_area, title, theme, |row| {
+        self.flux.render(frame, list_area, title, theme, |row| {
             suspended.and_then(|i| row.get(i)).is_some_and(|s| s == "True").then_some(suspended_style)
         });
+        if details > 0 {
+            self.draw_flux_details(frame, details_area, theme);
+        }
+    }
+
+    /// What the selected object is, what its state means, and what to try.
+    fn draw_flux_details(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let selected = self.flux_selection();
+        let kind = selected.as_ref().map_or(self.flux_kind(), |s| s.kind);
+        let mut text = vec![Line::styled(kind.card, theme.fg(theme.muted))];
+        if !kind.controller.is_empty() {
+            text.push(Line::styled(format!("Handled by the {}.", kind.controller), theme.fg(theme.muted)));
+        }
+        if let Some((meaning, next)) = selected.as_ref().and_then(FluxSelection::advice) {
+            text.push(Line::styled(meaning, theme.fg(theme.warning)));
+            text.push(Line::from(vec![
+                Span::styled(format!("$ {next}"), theme.fg(theme.accent)),
+                Span::styled("   p loads it into the prompt", theme.fg(theme.muted)),
+            ]));
+        }
+        let title = selected.as_ref().map_or(format!(" {} ", kind.label), |s| format!(" {} {} ", s.kind.kind, s.name));
+        let panel = Paragraph::new(text).wrap(Wrap { trim: false }).block(theme.block().title(title));
+        frame.render_widget(panel, area);
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -2251,6 +2794,9 @@ impl App {
             (Mode::ImportK3s(_), ..) => &[("Tab", "next field"), ("Enter", "next / fetch"), ("Esc", "cancel")],
             (Mode::ConfirmPlan { .. }, ..) => &[("y", "do it"), ("n", "cancel")],
             (Mode::PickPod { .. }, ..) => &[("↑↓", "pod"), ("Enter", "shell into it"), ("Esc", "cancel")],
+            (Mode::CreateFlux(_), ..) => &[("←→", "what"), ("Tab", "next field"), ("Enter", "next / run"), ("Esc", "cancel")],
+            (Mode::FluxChain(_), ..) => &[("↑↓", "link"), ("Enter", "go there"), ("Esc", "close")],
+            (Mode::FinishExperiment, ..) => &[("r", "resume"), ("k", "keep suspended"), ("Esc", "not yet")],
             (Mode::Blocked { .. }, ..) => &[("Enter", "open Tooling"), ("q", "quit")],
             (_, _, Tab::Contexts) => {
                 resource_hints = [("Enter", "use context"), ("a", "add"), ("K", "import k3s"), ("x", "remove")]
@@ -2272,8 +2818,11 @@ impl App {
                     (kind.scale, ("s", "scale")),
                     (kind.restart, ("r", "restart")),
                     (kind.restart, ("o", "rollout")),
+                    (kind.restart, ("i", "image")),
+                    (kind.restart, ("N", "env")),
+                    (kind.restart, ("p", "pull policy")),
                 ];
-                resource_hints = [("←→", "kind"), ("d", "describe"), ("y", "yaml"), ("v", "events")]
+                resource_hints = [("←→", "kind"), ("d", "describe"), ("y", "yaml"), ("v", "events"), ("t", "who manages it")]
                     .into_iter()
                     .chain(optional.into_iter().filter(|(on, _)| *on).map(|(_, hint)| hint))
                     .chain([("E", "edit"), ("x", "delete")])
@@ -2284,8 +2833,8 @@ impl App {
                 ("s", "status"), ("v/V", "values"), ("m", "manifest"), ("N", "notes"), ("h", "history"), ("b", "rollback"), ("x", "uninstall"),
             ],
             (_, _, Tab::Flux) => &[
-                ("←→", "kind"), ("r", "reconcile"), ("s/u", "suspend/resume"), ("S/U", "ALL off/on"), ("d", "describe"),
-                ("y", "yaml"), ("e", "events"), ("l", "logs"), ("t", "tree"), ("C", "check"),
+                ("←→", "kind"), ("X", "experiment"), ("f", "follow chain"), ("r", "reconcile"), ("s/u", "suspend/resume"), ("e", "events"), ("l", "logs"),
+                ("v", "values"), ("c", "create"), ("K", "controllers"),
             ],
             (_, _, Tab::Journal) => &[("Enter", "load into prompt"), ("c", "changes only"), ("a", "hide auto")],
             (_, _, Tab::Cheatsheet) => &[("/", "search"), ("Enter", "load into prompt")],
@@ -2300,7 +2849,54 @@ impl App {
 
     fn draw_popup(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         match &self.mode {
-            Mode::Confirm { message, argv } => {
+            Mode::CreateFlux(form) => form.render(frame, area, theme),
+            Mode::FluxChain(chain) => {
+                let height = (chain.links.len() as u16 + 2).min(area.height);
+                let popup = area.centered(Constraint::Length(80.min(area.width)), Constraint::Length(height));
+                let items: Vec<ListItem> = chain
+                    .links
+                    .iter()
+                    .map(|link| ListItem::new(format!("{:<13} {}/{} ({})", link.role, link.kind, link.name, link.namespace)))
+                    .collect();
+                let list = List::new(items)
+                    .block(
+                        Block::bordered()
+                            .style(theme.popup())
+                            .border_style(theme.fg(theme.accent))
+                            .title(format!(" {} depends on ", chain.owner))
+                            .title_bottom(Line::styled(" Enter go there · Esc close ", theme.fg(theme.muted))),
+                    )
+                    .highlight_style(theme.selected())
+                    .highlight_symbol("▶ ");
+                frame.render_widget(Clear, popup);
+                frame.render_stateful_widget(list, popup, &mut self.flux_chain_state);
+            }
+            Mode::FinishExperiment => {
+                let Some(experiment) = &self.experiment else { return };
+                let changes = self.journal.changes_since(experiment.journal_mark);
+                let mut text = vec![Line::from(format!("Finish the experiment on {}?", experiment.label())).bold(), Line::from("")];
+                if changes.is_empty() {
+                    text.push(Line::styled("kubewatcher ran no changes since it was suspended.", theme.fg(theme.muted)));
+                } else {
+                    text.push(Line::styled("What you changed through kubewatcher since it was suspended:", theme.fg(theme.muted)));
+                    text.extend(changes.iter().map(|c| Line::styled(format!("  $ {c}"), theme.fg(theme.warning))));
+                }
+                text.push(Line::from(""));
+                text.push(Line::from(experiment.resume_effect()));
+                text.push(Line::styled("To keep a change for good, put it in the source: git or your chart.", theme.fg(theme.muted)));
+                text.push(Line::from(""));
+                text.push(Line::from(vec![
+                    Span::styled(" r ", theme.badge(theme.danger)),
+                    Span::raw(" resume   "),
+                    Span::styled(" k ", theme.badge(theme.accent)),
+                    Span::raw(" stop tracking, keep it suspended   "),
+                    Span::styled(" Esc ", theme.chip()),
+                    Span::raw(" not yet"),
+                ]));
+                let height = Self::wrapped_height(&text, 90.min(area.width)) + 2;
+                Self::popup(frame, area, " Experiment ", theme, theme.secondary, 90, height, Paragraph::new(text).wrap(Wrap { trim: false }));
+            }
+            Mode::Confirm { message, argv, .. } => {
                 let command = helpers::shell_join(argv);
                 let mut text = vec![Line::from(message.as_str()).bold(), Line::from(""), Line::styled("This runs:", theme.fg(theme.muted))];
                 // `a && b` chains read better one command per line.
@@ -2316,7 +2912,7 @@ impl App {
                     Span::styled(" n ", theme.chip()),
                     Span::raw(" cancel"),
                 ]));
-                let height = text.len() as u16 + 2;
+                let height = Self::wrapped_height(&text, 90.min(area.width)) + 2;
                 Self::popup(frame, area, " Confirm ", theme, theme.danger, 90, height, Paragraph::new(text).wrap(Wrap { trim: false }));
             }
             Mode::Prompt(prompt) => {
@@ -2324,13 +2920,23 @@ impl App {
                     Prompt::Scale { target, .. } => format!("Replicas for {target}:"),
                     Prompt::PortForward { target, .. } => format!("Ports for {target} (LOCAL:REMOTE):"),
                     Prompt::Rollback { release, .. } => format!("Roll back {release} to revision:"),
+                    Prompt::FluxDiff { name, .. } => format!("Local folder to compare {name} with (read-only):"),
+                    Prompt::Image { target, .. } => format!("Images for {target} (CONTAINER=IMAGE:TAG …):"),
+                    Prompt::Env { target, .. } => format!("Env change for {target} (KEY=VALUE sets, KEY- removes):"),
                 };
-                let text = vec![
-                    Line::from(label),
-                    Line::from(vec![Span::raw(format!("> {}", self.input)), Span::styled("█", theme.fg(theme.accent))]),
-                    Line::styled(" Enter confirm · Esc cancel", theme.fg(theme.muted)),
-                ];
-                Self::popup(frame, area, " Input ", theme, theme.accent, 60, 5, Paragraph::new(text));
+                let mut text = Vec::new();
+                if let Prompt::Env { current, .. } = prompt {
+                    text.extend(current.iter().take(20).map(|l| Line::styled(format!("  {l}"), theme.fg(theme.muted))));
+                    if current.is_empty() {
+                        text.push(Line::styled("  (no env vars set)", theme.fg(theme.muted)));
+                    }
+                }
+                let width = if matches!(prompt, Prompt::Image { .. } | Prompt::Env { .. }) { 90 } else { 60 };
+                text.push(Line::from(label));
+                text.push(Line::from(vec![Span::raw(format!("> {}", self.input)), Span::styled("█", theme.fg(theme.accent))]));
+                text.push(Line::styled(" Enter confirm · Esc cancel", theme.fg(theme.muted)));
+                let height = text.len() as u16 + 2;
+                Self::popup(frame, area, " Input ", theme, theme.accent, width, height, Paragraph::new(text));
             }
             Mode::AddContext(form) => {
                 let file = match (&self.machine, form.name()) {
@@ -2431,12 +3037,15 @@ impl App {
                 frame.render_stateful_widget(list, popup, &mut self.port_forward_state);
             }
             Mode::Help => {
-                let mut lines: Vec<Line> = HELP.lines().map(Line::from).collect();
-                lines.push(Line::from("ALIASES (command prompt)"));
-                lines.push(Line::styled(
-                    format!("  {} oh-my-zsh style aliases (kgp, klf, kgpa, ked, ...): Cheatsheet (6), filter /alias", helpers::ALIASES.len()),
-                    theme.fg(theme.muted),
-                ));
+                // The Flux keys get a page of their own: the full list wouldn't fit a normal terminal.
+                let mut lines: Vec<Line> = if self.tab == Tab::Flux { FLUX_HELP } else { HELP }.lines().map(Line::from).collect();
+                if self.tab != Tab::Flux {
+                    lines.push(Line::from("ALIASES (command prompt)"));
+                    lines.push(Line::styled(
+                        format!("  {} oh-my-zsh style aliases (kgp, klf, kgpa, ked, ...): Cheatsheet (6), filter /alias", helpers::ALIASES.len()),
+                        theme.fg(theme.muted),
+                    ));
+                }
                 let height = lines.len() as u16 + 2;
                 Self::popup(frame, area, " Help ", theme, theme.accent, 96, height, Paragraph::new(lines));
             }
@@ -2496,6 +3105,13 @@ impl App {
         frame.render_widget(Paragraph::new(lines).block(block), popup);
     }
 
+    /// Rows these lines take in a popup this wide, so wrapping never pushes out the last line.
+    /// Estimated a little narrow, as word wrap breaks lines earlier than the full width.
+    fn wrapped_height(lines: &[Line], popup_width: u16) -> u16 {
+        let width = popup_width.saturating_sub(6).max(1) as usize;
+        lines.iter().map(|line| line.width().div_ceil(width).max(1) as u16).sum()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn popup(frame: &mut Frame, area: Rect, title: &str, theme: &Theme, color: Color, width: u16, height: u16, content: Paragraph) {
         let popup = area.centered(Constraint::Length(width.min(area.width)), Constraint::Length(height.min(area.height)));
@@ -2529,18 +3145,41 @@ COMMAND PROMPT (:)
 RESOURCES
   ←/→ [ ]  kind     d describe   y yaml     v events     l logs -f   L previous logs
   e shell (workloads: pick a pod)  E edit       f port-forward          s scale     r restart
-  o rollout status  x delete
+  o rollout status  x delete         t who manages it   i image tag   N env vars   p pull policy
 HELM
   s status  v values  V all values  m manifest  N notes  h history  b rollback  x uninstall
-FLUX
-  r reconcile now   s/u suspend/resume one   S/U suspend/resume ALL of this kind (Flux off/on)
-  d describe  y yaml  e events  l controller logs  t tree (kustomizations)  C flux check
+FLUX (press ? on the Flux tab for all its keys)
+  overview first  X experiment  f follow chain  r reconcile  s/u suspend/resume  c create  K controllers
 JOURNAL (5)
   every command kubewatcher runs, with time, duration, result and what triggered it
   saved to ~/.local/state/kubewatcher/journal/YYYY-MM-DD.log (one file per day)
   Enter loads a command into the prompt · c changes only · a hide automatic refreshes
 VIEWER
   j/k space/u g/G scroll · h/l sideways · w toggle watch · r rerun · f follow · q close";
+
+const FLUX_HELP: &str = "\
+HOW FLUX WORKS
+  A source fetches content → a Kustomization or HelmRelease applies it → the cluster follows.
+  Change the source, not the cluster. To try something live, suspend first: that's what X does.
+SEE WHAT'S GOING ON
+  ←/→ [ ]  kind; overview comes first, most urgent on top       a  only problems (overview)
+  d describe   y yaml   e events   l controller logs   t tree (kustomizations)
+  f follow the chain: what it depends on, Enter jumps there
+  p load the suggested next command into the prompt
+  C flux check   K controllers: pods, flux stats, recent errors
+  On the Resources tab, t answers who manages an object (flux trace)
+TRY THINGS SAFELY
+  X experiment: suspend it, change things live, X again shows what you changed and resumes
+  D compare a Kustomization with a local folder, before you push (flux diff)
+CHANGE WHAT FLUX DOES
+  r reconcile now   s/u suspend/resume one   S/U suspend/resume ALL of one kind (Flux off/on)
+HELMRELEASES
+  v final values (can show secrets; never logged)   h history   i status
+  Z reset the failure count after retries ran out   F force an install or upgrade
+KUSTOMIZATIONS
+  v final variables   h history   i status
+CREATE
+  c builds a flux create … --export command. It only prints YAML: commit it and Flux applies it.";
 
 #[cfg(test)]
 mod tests {
@@ -2809,8 +3448,8 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         assert_eq!((app.current_context.as_str(), app.namespace.as_deref()), ("prod", Some("shop")));
         let commands = script.borrow().commands.join("\n");
         assert!(commands.contains("kubectl get pods -n shop -o wide"));
-        assert!(commands.contains("helm list --all -o json -n shop"));
-        assert!(commands.contains("flux get kustomizations -A"));
+        assert!(commands.contains("helm list --deployed --failed --pending -o json -n shop"));
+        assert!(commands.contains("flux get all -A"));
 
         // Later refreshes keep the namespace you picked.
         app.namespace = Some("other".into());
@@ -2991,7 +3630,8 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         let config = machine.kube_config();
         let config_d = machine.config_d();
         let view = |file: &Path| format!("kubectl config view --kubeconfig={} -o json", file.display());
-        let both = r#"{"current-context":"prod","contexts":[{"name":"prod"},{"name":"staging"}]}"#;
+        let both = r#"{"current-context":"prod","contexts":[{"name":"prod","context":{"cluster":"prod"}},{"name":"staging"}],
+            "clusters":[{"name":"prod","cluster":{"server":"https://10.0.0.7:6443"}}]}"#;
         script.borrow_mut().replies = vec![
             (Box::leak(view(&config).into_boxed_str()), Ok(both.into())),
             (Box::leak(format!("kubectl config view --kubeconfig={} --context=prod", config.display()).into_boxed_str()), Ok("apiVersion: v1\ncurrent-context: prod\nclusters: []\n".into())),
@@ -3001,6 +3641,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         app.tab = Tab::Contexts;
         let screen = draw(&mut app);
         assert!(screen.contains("FILE") && screen.contains("~/.kube/config") && screen.contains("S splits them"));
+        assert!(screen.contains("SERVER") && screen.contains("https://10.0.0.7:6443"), "{screen}");
 
         // Adding: a taken name is refused; a new one gets its own file.
         press(&mut app, KeyCode::Char('a'));
@@ -3144,6 +3785,61 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         press(&mut app, KeyCode::Char('['));
         press(&mut app, KeyCode::Left);
         assert_eq!(app.kind().name, "pods");
+    }
+
+    #[test]
+    fn workload_keys_set_image_env_and_pull_policy() {
+        let (mut app, script) = loaded();
+        show(&mut app, "deployments", "\
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES                 SELECTOR
+web    1/1     1            1           1d    web,side     nginx:1.25,busybox     app=web
+");
+
+        // i: prefilled with the current images, so fiddling with a tag is one edit.
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.input, "web=nginx:1.25 side=busybox");
+        assert!(draw(&mut app).contains("Images for deployments/web"));
+        for _ in 0.."side=busybox".len() + 1 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Backspace);
+        keys(&mut app, "7");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(last(&script), "capture: kubectl set image deployments/web web=nginx:1.27 -n shop");
+        press(&mut app, KeyCode::Char('i'));
+        app.input = "nonsense".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(status(&app).contains("CONTAINER=IMAGE:TAG"));
+
+        // N: shows the current env, applies a change and offers it again next time.
+        script.borrow_mut().replies = vec![
+            ("kubectl set env deployments/web --list", Ok("# deployments/web, container web\nLOG=debug\n".into())),
+            ("kubectl get deployments/web -o", Ok("Always IfNotPresent".into())),
+        ];
+        press(&mut app, KeyCode::Char('N'));
+        assert!(draw(&mut app).contains("LOG=debug"));
+        keys(&mut app, "LOG=info MODE-");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(last(&script), "capture: kubectl set env deployments/web LOG=info MODE- -n shop");
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.input, "LOG=info MODE-");
+        app.input = "=x".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(status(&app).contains("KEY=VALUE"));
+
+        // p: not all Always yet, so every container goes to Always.
+        press(&mut app, KeyCode::Char('p'));
+        let patch = r#"[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"},{"op":"replace","path":"/spec/template/spec/containers/1/imagePullPolicy","value":"Always"}]"#;
+        assert_eq!(last(&script), format!("capture: kubectl patch deployments/web --type=json -p '{patch}' -n shop"));
+        script.borrow_mut().replies = vec![("kubectl get deployments/web -o", Ok("Always Always".into()))];
+        press(&mut app, KeyCode::Char('p'));
+        assert!(last(&script).contains(r#""value":"IfNotPresent""#));
+
+        show(&mut app, "services", SERVICES);
+        for (key, what) in [('i', "set image"), ('N', "set env"), ('p', "imagePullPolicy")] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(status(&app), format!("✘ {what} is not available for services"));
+        }
     }
 
     #[test]
@@ -3326,6 +4022,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
     fn flux_keys_suspend_resume_reconcile_and_inspect() {
         let (mut app, script) = loaded();
         press(&mut app, KeyCode::Char('4'));
+        app.show_flux_kind(1);
         app.on_output(Target::Flux(app.flux.request), Ok(FLUX.into()));
         assert_eq!(app.completer.flux_names, ["apps", "core"]);
         assert!(draw(&mut app).contains("Flux kustomizations (all namespaces)"));
@@ -3347,7 +4044,6 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         for (key, expected) in [
             ('d', "capture: kubectl describe kustomizations.kustomize.toolkit.fluxcd.io apps -n flux-system"),
             ('y', "capture: kubectl get kustomizations.kustomize.toolkit.fluxcd.io apps -o yaml -n flux-system"),
-            ('r', "stream: flux reconcile kustomization apps -n flux-system --with-source"),
             ('e', "capture: flux events --for Kustomization/apps -n flux-system"),
             ('l', "stream: flux logs --follow --tail=200 --kind=Kustomization --name=apps -n flux-system"),
             ('t', "capture: flux tree kustomization apps -n flux-system"),
@@ -3356,6 +4052,17 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
             assert_eq!(last(&script), expected);
             press(&mut app, KeyCode::Char('q'));
         }
+
+        // Reconcile changes the cluster, so it asks first, then streams flux's progress.
+        script.borrow_mut().commands.clear();
+        press(&mut app, KeyCode::Char('r'));
+        assert!(script.borrow().commands.is_empty());
+        assert!(matches!(&app.mode, Mode::Confirm { message, .. } if message.starts_with("Reconcile Kustomization apps")));
+        assert!(draw(&mut app).contains("$ flux reconcile kustomization apps -n flux-system --with-source"));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(last(&script), "stream: flux reconcile kustomization apps -n flux-system --with-source");
+        press(&mut app, KeyCode::Char('q'));
+
         for (key, expected) in [('s', "capture: flux suspend kustomization apps -n flux-system"), ('u', "capture: flux resume kustomization apps -n flux-system")] {
             press(&mut app, KeyCode::Char(key));
             press(&mut app, KeyCode::Char('y'));
@@ -3365,10 +4072,13 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('z'));
 
-        // Already the first kind: nothing to reload.
+        // Already the first entry: nothing to reload.
+        app.flux_kind_index = 0;
         script.borrow_mut().commands.clear();
         press(&mut app, KeyCode::Left);
         assert!(script.borrow().commands.is_empty());
+        press(&mut app, KeyCode::Right);
+        assert_eq!(last(&script), "capture: flux get kustomizations -A");
         press(&mut app, KeyCode::Right);
         assert_eq!(last(&script), "capture: flux get helmreleases -A");
         press(&mut app, KeyCode::Char(']'));
@@ -3388,10 +4098,459 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         app.on_output(Target::Flux(app.flux.request), Ok("NAMESPACE\tNAME\nflux-system\trepo\n".into()));
         assert!(draw(&mut app).contains("repo"));
         press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(last(&script), "stream: flux reconcile source git repo -n flux-system");
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(status(&app), "✘ flux tree only works for kustomizations");
+    }
+
+    /// `flux get all -A` as the real CLI prints it: one table per kind.
+    const FLUX_ALL: &str = "NAMESPACE  \tNAME                 \tREVISION\tSUSPENDED\tREADY\tMESSAGE\t\n\
+flux-system\tocirepository/homelab\t0.1.0   \tFalse    \tTrue \tstored artifact\t\n\
+\n\
+NAMESPACE  \tNAME               \tREVISION\tSUSPENDED\tREADY\tMESSAGE\t\n\
+flux-system\thelmrelease/homelab\t0.1.0   \tTrue     \tTrue \tHelm upgrade succeeded\t\n\
+apps       \thelmrelease/web    \t1.0     \tFalse    \tFalse\tupgrade retries exhausted\t\n";
+
+    fn flux_overview() -> (App, Rc<RefCell<Script>>) {
+        let (mut app, script) = loaded();
+        press(&mut app, KeyCode::Char('4'));
+        app.on_output(Target::Flux(app.flux.request), Ok(FLUX_ALL.into()));
+        (app, script)
+    }
+
+    #[test]
+    fn helm_commands_look_where_flux_stores_the_release() {
+        let (mut app, script) = loaded();
+        press(&mut app, KeyCode::Char('3'));
+        let homelab = r#"[{"name":"homelab","namespace":"homelab","revision":"31","status":"deployed","chart":"homelab-0.1"}]"#;
+        app.on_output(Target::Helm(app.helm.request), Ok(homelab.into()));
+
+        // Not known to be Flux's: the release's own namespace, as before.
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(last(&script), "capture: helm history homelab -n homelab");
+        press(&mut app, KeyCode::Char('q'));
+
+        // Blank lines are HelmReleases that never installed.
+        app.on_output(Target::HelmStorage, Ok("homelab\thomelab\tflux-system\n\t\t\n".into()));
+        assert_eq!(app.helm_storage.len(), 1);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(last(&script), "capture: helm history homelab -n flux-system");
+        press(&mut app, KeyCode::Char('q'));
+
+        // What fights Flux says so before it runs.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(&app.mode, Mode::Confirm { message, argv, .. }
+            if message.contains("Flux manages it") && helpers::shell_join(argv) == "helm uninstall homelab -n flux-system"));
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('b'));
+        assert!(status(&app).contains("its next upgrade replaces a rollback"));
+        assert!(matches!(app.mode, Mode::Prompt(Prompt::Rollback { .. })));
+        press(&mut app, KeyCode::Esc);
+
+        // The note explains why the release isn't listed under its own namespace.
+        let screen = draw_sized(&mut app, 170, 40);
+        assert!(screen.contains("Flux keeps its Helm records in flux-system") && screen.contains("don't show under this namespace"), "{screen}");
+        app.namespace = Some("flux-system".into());
+        assert!(draw_sized(&mut app, 170, 40).contains("It may undo what you change here"));
+
+        // Clusters without Flux just have nothing to look up.
+        app.on_output(Target::HelmStorage, Err("the server doesn't have a resource type".into()));
+        assert!(app.helm_storage.is_empty());
+        assert!(!draw(&mut app).contains("Flux keeps"));
+    }
+
+    #[test]
+    fn a_long_confirm_message_keeps_its_answers_on_screen() {
+        let (mut app, _script) = flux_overview();
+        press(&mut app, KeyCode::Char('r'));
+        let screen = draw(&mut app);
+        // Once in the popup and once in the hint bar.
+        assert_eq!(screen.matches("edit in prompt first").count(), 2, "{screen}");
+    }
+
+    #[test]
+    fn long_messages_never_cut_the_names_you_act_on() {
+        let (mut app, _script) = loaded();
+        press(&mut app, KeyCode::Char('4'));
+        let message = "x".repeat(200);
+        let revision = "0.1.0-hcc386a133f36@sha256:aaf925d1";
+        let text = format!("NAMESPACE\tNAME\tREVISION\tSUSPENDED\tREADY\tMESSAGE\nflux-system\tocirepository/homelab\t{revision}\tFalse\tTrue\t{message}\n");
+        app.on_output(Target::Flux(app.flux.request), Ok(text));
+        let screen = draw_sized(&mut app, 120, 40);
+        assert!(screen.contains("ocirepository/homelab") && screen.contains(revision), "{screen}");
+
+        // Too many columns for the screen: the ones on the right give way, not the names.
+        let cells: Vec<String> = (0..12).map(|i| format!("column-{i}-{}", "x".repeat(20))).collect();
+        let row = |name: &str| format!("{name:<24}{}\n", cells.join("  "));
+        let text = [row("NAME"), row("bookkeeping-backend"), row("bookkeeping-frontend")].concat();
+        show(&mut app, "deployments", &text);
+        let screen = draw_sized(&mut app, 120, 40);
+        assert!(screen.contains("bookkeeping-backend") && screen.contains("bookkeeping-frontend"), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_stream_is_journaled_as_failed() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(last(&script).starts_with("stream: flux reconcile"));
+
+        // Swap in a command that really fails, as a refused reconcile does.
+        let generation = app.next_generation;
+        let viewer = app.viewer.as_mut().unwrap();
+        viewer.attach_stream(helpers::spawn_background(&helpers::shell("exit 3")).unwrap());
+        let journal = viewer.journal;
+        app.handle_msg(Msg::StreamEnd { generation });
+        assert!(app.journal.changes_since(journal - 1).is_empty(), "a failed change didn't happen");
+    }
+
+    #[test]
+    fn the_overview_mixes_all_kinds_with_the_most_urgent_first() {
+        let (mut app, script) = flux_overview();
+        let screen = draw(&mut app);
+        assert!(screen.contains("Flux overview (all namespaces)"), "{screen}");
+        assert_eq!(app.completer.flux_names, ["web", "homelab", "homelab"]);
+
+        // Actions use the row's own kind, and its diagnosis is on screen.
+        assert!(screen.contains("Helm gave up"), "{screen}");
+        assert!(screen.contains("$ flux reconcile helmrelease web -n apps --reset"), "{screen}");
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(last(&script), "capture: kubectl describe helmreleases.helm.toolkit.fluxcd.io web -n apps");
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.mode, Mode::Command));
+        assert_eq!(app.input, "flux reconcile helmrelease web -n apps --reset");
+        press(&mut app, KeyCode::Esc);
+
+        // The next row is another kind and suspended; the third is healthy.
+        press(&mut app, KeyCode::Down);
+        let screen = draw(&mut app);
+        assert!(screen.contains("Suspended: Flux ignores it") && screen.contains("$ flux resume helmrelease homelab -n flux-system"), "{screen}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(last(&script), "stream: flux reconcile source oci homelab -n flux-system");
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(status(&app), "homelab is healthy: nothing to suggest");
+
+        // Only what needs attention, and never "suspend everything of every kind".
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.flux.visible().len(), 2);
+        assert!(draw(&mut app).contains("problems only"));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.flux.visible().len(), 3);
+        script.borrow_mut().commands.clear();
+        press(&mut app, KeyCode::Char('S'));
+        assert!(status(&app).contains("pick it with"));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn the_banner_shows_on_every_tab_and_follows_the_cluster() {
+        let (mut app, script) = loaded();
+        assert!(!draw(&mut app).contains("Flux paused"));
+        assert_eq!(script.borrow().commands.iter().filter(|c| *c == "capture: flux get all -A").count(), 1);
+
+        app.on_output(Target::FluxHealth, Ok(FLUX_ALL.into()));
+        for key in ['1', '2', '3', '4', '6', '7'] {
+            press(&mut app, KeyCode::Char(key));
+            let screen = draw(&mut app);
+            assert!(screen.contains("Flux paused for helmrelease/homelab") && screen.contains("failing: helmrelease/web"), "{screen}");
+        }
+        // Stale news is worse than none, and a failed check says nothing about the cluster.
+        app.on_output(Target::FluxHealth, Err("connection refused".into()));
+        assert!(!draw(&mut app).contains("Flux paused"));
+
+        // Polled in the background while you are elsewhere.
+        press(&mut app, KeyCode::Char('2'));
+        app.flux_health_checked = None;
+        script.borrow_mut().commands.clear();
+        app.tick();
+        assert_eq!(last(&script), "capture: flux get all -A");
+        script.borrow_mut().commands.clear();
+        app.tick();
+        assert!(script.borrow().commands.is_empty());
+    }
+
+    #[test]
+    fn empty_and_not_installed_kinds_are_not_failures() {
+        let (mut app, _script) = flux_overview();
+        let alerts = FLUX_KINDS.iter().position(|k| k.kind == "Alert").unwrap();
+        app.show_flux_kind(alerts);
+        app.on_output(Target::Flux(app.flux.request), Err("✗ unable to retrieve the complete list of server APIs: notification.toolkit.fluxcd.io/v1: no matches".into()));
+        assert!(draw(&mut app).contains("doesn't run the notification-controller"));
+        app.on_output(Target::Flux(app.flux.request), Err("✗ no Alert objects found in any namespace".into()));
+        let screen = draw(&mut app);
+        assert!(screen.contains("No resources found") && !screen.contains("objects found"), "{screen}");
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(status(&app), "✘ no alerts selected");
+
+        // Kinds without a reconcile say so instead of running a command that can't work.
+        app.on_output(Target::Flux(app.flux.request), Ok("NAMESPACE\tNAME\nflux-system\tnotify\n".into()));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(status(&app).contains("no reconcile for Alert"));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn trace_answers_who_manages_a_resource() {
+        let (mut app, script) = loaded();
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(last(&script), "stream: flux trace pods/web-1 -n shop");
+        press(&mut app, KeyCode::Char('q'));
+        show(&mut app, "deployments", DEPLOYMENTS);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(last(&script), "stream: flux trace deployments/web -n shop");
+        press(&mut app, KeyCode::Char('q'));
+        show(&mut app, "nodes", NODES);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(last(&script), "stream: flux trace nodes/worker-1");
+        press(&mut app, KeyCode::Char('q'));
+        show(&mut app, "events", "NAME   REASON\nx      Started\n");
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(status(&app), "✘ flux trace is not available for events");
+    }
+
+    #[test]
+    fn the_chain_lists_what_an_object_depends_on_and_jumps_there() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('f'));
+        let asked = last(&script);
+        assert!(asked.starts_with("capture: kubectl get helmreleases.helm.toolkit.fluxcd.io homelab -o 'jsonpath="), "{asked}");
+        assert!(asked.ends_with("-n flux-system") && !asked.contains("yaml"), "values must stay out: {asked}");
+
+        // An answer to an older question is ignored.
+        let request = app.next_chain_lookup;
+        app.on_output(Target::FluxChain(request + 1), Ok("\n\n{\"kind\":\"OCIRepository\",\"name\":\"other\"}\n\n".into()));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        app.on_output(Target::FluxChain(request), Ok("\n\n{\"kind\":\"OCIRepository\",\"name\":\"homelab\"}\n[{\"name\":\"db\"}]\n".into()));
+        assert!(matches!(&app.mode, Mode::FluxChain(chain) if chain.links.len() == 2));
+        let screen = draw(&mut app);
+        assert!(screen.contains("HelmRelease homelab depends on") && screen.contains("OCIRepository/homelab (flux-system)"), "{screen}");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.flux_kind().kind, "OCIRepository");
+        assert_eq!(app.flux.filter, "homelab");
+        assert_eq!(last(&script), "capture: flux get sources oci -A");
+
+        // A source is the start of the chain.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Esc);
+        app.on_output(Target::Flux(app.flux.request), Ok("NAMESPACE\tNAME\nflux-system\thomelab\n".into()));
+        press(&mut app, KeyCode::Char('f'));
+        app.on_output(Target::FluxChain(app.next_chain_lookup), Ok("\n\n\n\n".into()));
+        assert_eq!(status(&app), "OCIRepository homelab depends on nothing: it is where the chain starts");
+        press(&mut app, KeyCode::Char('f'));
+        app.on_output(Target::FluxChain(app.next_chain_lookup), Err("forbidden".into()));
+        assert_eq!(status(&app), "✘ forbidden");
+    }
+
+    #[test]
+    fn helmrelease_debugging_and_recovery_use_real_flags() {
+        let (mut app, script) = flux_overview();
+        for (key, expected) in [
+            ('v', "capture: flux debug helmrelease web --show-values -n apps"),
+            ('h', "capture: flux debug helmrelease web --show-history -n apps"),
+            ('i', "capture: flux debug helmrelease web --show-status -n apps"),
+        ] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(last(&script), expected);
+            press(&mut app, KeyCode::Char('q'));
+        }
+        for (key, expected) in [('Z', "stream: flux reconcile helmrelease web -n apps --reset"), ('F', "stream: flux reconcile helmrelease web -n apps --force")] {
+            script.borrow_mut().commands.clear();
+            press(&mut app, KeyCode::Char(key));
+            assert!(script.borrow().commands.is_empty(), "{key} must ask first");
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(last(&script), expected);
+            press(&mut app, KeyCode::Char('q'));
+        }
+        // Only for the kinds where flux offers them.
+        press(&mut app, KeyCode::Char('G'));
+        for (key, error) in [('Z', "only exist for HelmReleases"), ('v', "flux debug only works"), ('D', "flux diff only works")] {
+            press(&mut app, KeyCode::Char(key));
+            assert!(status(&app).contains(error), "{}", status(&app));
+        }
+    }
+
+    #[test]
+    fn kustomizations_compare_with_a_local_folder_and_remember_it() {
+        let (mut app, script) = loaded();
+        press(&mut app, KeyCode::Char('4'));
+        app.show_flux_kind(1);
+        app.on_output(Target::Flux(app.flux.request), Ok(FLUX.into()));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(draw(&mut app).contains("Local folder to compare apps with"));
+        press(&mut app, KeyCode::Enter);
+        assert!(status(&app).contains("enter the local path"));
+
+        press(&mut app, KeyCode::Char('D'));
+        keys(&mut app, "./clusters/home");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(last(&script), "stream: flux diff kustomization apps --path=./clusters/home --progress-bar=false -n flux-system");
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.input, "./clusters/home");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(last(&script), "capture: flux debug kustomization apps --show-vars -n flux-system");
+    }
+
+    #[test]
+    fn an_experiment_suspends_tracks_changes_and_resumes() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Down);
+
+        // Nothing happens until you say yes, and the suspend must succeed before it counts.
+        script.borrow_mut().commands.clear();
+        press(&mut app, KeyCode::Char('X'));
+        assert!(script.borrow().commands.is_empty());
+        assert!(draw(&mut app).contains("$ flux suspend helmrelease homelab -n flux-system"));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(last(&script), "capture: flux suspend helmrelease homelab -n flux-system");
+        assert!(app.experiment.is_none());
+        app.on_output(Target::ExperimentStarted, Err("forbidden".into()));
+        assert!(app.experiment.is_none() && app.pending_experiment.is_none());
+        assert_eq!(status(&app), "✘ forbidden");
+
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('y'));
+        app.on_output(Target::ExperimentStarted, Ok(String::new()));
+        assert_eq!(app.experiment.as_ref().unwrap().label(), "HelmRelease homelab");
+        assert!(draw(&mut app).contains("experiment: HelmRelease homelab"));
+
+        // It can't be forgotten: leaving warns once, and switching clusters is refused.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.running && status(&app).contains("still suspended"));
+        press(&mut app, KeyCode::Char('1'));
+        app.on_output(Target::Contexts, Ok(CONTEXTS.into()));
+        script.borrow_mut().commands.clear();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(status(&app).contains("finish the experiment first"));
+        assert!(script.borrow().commands.is_empty());
+
+        // Changes made meanwhile are listed when finishing.
+        press(&mut app, KeyCode::Char('2'));
+        show(&mut app, "deployments", DEPLOYMENTS);
+        press(&mut app, KeyCode::Char('s'));
+        input_clear_and_type(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::FinishExperiment));
+        let screen = draw(&mut app);
+        assert!(screen.contains("$ kubectl scale deployments/web --replicas=5 -n shop"), "{screen}");
+        assert!(screen.contains("driftDetection"), "{screen}");
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(draw(&mut app).contains("$ flux resume helmrelease homelab -n flux-system"));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(last(&script), "capture: flux resume helmrelease homelab -n flux-system");
+        app.on_output(Target::ExperimentEnded, Err("timed out".into()));
+        assert!(app.experiment.is_some(), "still suspended, so still tracked");
+        app.on_output(Target::ExperimentEnded, Ok(String::new()));
+        assert!(app.experiment.is_none());
+        assert!(status(&app).contains("resumed"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.running);
+    }
+
+    fn input_clear_and_type(app: &mut App, text: &str) {
+        app.input.clear();
+        keys(app, text);
+    }
+
+    #[test]
+    fn stopping_tracking_leaves_the_object_suspended() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('y'));
+        app.on_output(Target::ExperimentStarted, Ok(String::new()));
+        press(&mut app, KeyCode::Char('X'));
+        script.borrow_mut().commands.clear();
+        press(&mut app, KeyCode::Char('k'));
+        assert!(app.experiment.is_none() && script.borrow().commands.is_empty());
+        assert!(status(&app).contains("stays suspended"));
+    }
+
+    #[test]
+    fn the_create_form_previews_and_writes_yaml_without_touching_the_cluster() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(draw(&mut app).contains("Create a Flux object"));
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "repo");
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "github.com/org/repo");
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Tab);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(last(&script), "capture: flux create source git repo --url=https://github.com/org/repo --branch=main --interval=10m --namespace=flux-system --export");
+        press(&mut app, KeyCode::Char('q'));
+
+        // Bad input stays in the form.
+        press(&mut app, KeyCode::Char('c'));
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Tab);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::CreateFlux(_)));
+        assert!(status(&app).contains("name"));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        let dir = helpers::test_dir("flux_create_save");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("repo.yaml");
+        let existing = dir.join("existing.yaml");
+        fs::write(&existing, "keep me").unwrap();
+        for (path, refused) in [(&existing, true), (&target, false)] {
+            press(&mut app, KeyCode::Char('c'));
+            press(&mut app, KeyCode::Tab);
+            keys(&mut app, "repo");
+            press(&mut app, KeyCode::Tab);
+            keys(&mut app, "github.com/org/repo");
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Tab);
+            }
+            keys(&mut app, &path.display().to_string());
+            press(&mut app, KeyCode::Enter);
+            if refused {
+                assert!(status(&app).contains("already exists"));
+                assert_eq!(fs::read_to_string(&existing).unwrap(), "keep me");
+                press(&mut app, KeyCode::Esc);
+            }
+        }
+        assert!(matches!(&app.mode, Mode::Confirm { message, .. } if message.starts_with("Write this Git source")));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(last(&script).ends_with(&format!("--export > {}", helpers::shell_join(&[target.display().to_string()]))), "{}", last(&script));
+    }
+
+    #[test]
+    fn the_flux_tab_has_its_own_help_and_a_controller_view() {
+        let (mut app, script) = flux_overview();
+        press(&mut app, KeyCode::Char('?'));
+        let screen = draw(&mut app);
+        assert!(screen.contains("HOW FLUX WORKS") && screen.contains("final values"), "{screen}");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(last(&script), "stream: kubectl get pods -n flux-system; echo; flux stats -A; echo; flux logs -A --level=error --tail=30");
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(draw(&mut app).contains("press ? on the Flux tab"));
     }
 
     #[test]
@@ -3401,7 +4560,7 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         assert!(draw(&mut app).contains("Journal"));
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Command));
-        assert_eq!(app.input, "flux get kustomizations -A");
+        assert_eq!(app.input, "flux get all -A");
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('c'));
         press(&mut app, KeyCode::Char('a'));
@@ -3656,8 +4815,8 @@ infra\tcore\tmain@sha1:abc\tFalse\tFalse\tfailed\n";
         app.watch = true;
         for (tab, expected) in [
             (Tab::Resources, "capture: kubectl get pods -n shop -o wide"),
-            (Tab::Helm, "capture: helm list --all -o json -n shop"),
-            (Tab::Flux, "capture: flux get kustomizations -A"),
+            (Tab::Helm, "capture: helm list --deployed --failed --pending -o json -n shop"),
+            (Tab::Flux, "capture: flux get all -A"),
             (Tab::Contexts, "capture: kubectl config get-contexts"),
         ] {
             app.tab = tab;

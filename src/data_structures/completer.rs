@@ -46,9 +46,9 @@ const HELM_VERBS: &[&str] = &[
 const HELM_GET: &[&str] = &["values", "manifest", "notes", "all", "hooks"];
 const HELM_REPO: &[&str] = &["add", "update", "list", "remove"];
 const FLUX_VERBS: &[&str] = &[
-    "get", "reconcile", "suspend", "resume", "logs", "events", "tree", "check", "diff", "create", "export", "stats",
+    "get", "reconcile", "suspend", "resume", "logs", "events", "tree", "trace", "debug", "check", "diff", "create", "export", "stats",
 ];
-const FLUX_KINDS: &[&str] = &["kustomization", "helmrelease", "source", "all"];
+const FLUX_KINDS: &[&str] = &["kustomization", "helmrelease", "source", "image", "alert", "alert-provider", "receiver", "all"];
 const HELM_FLAGS: &[&str] = &[
     "-n", "-A", "-f", "--set", "--reuse-values", "--install", "--create-namespace", "--atomic", "--dry-run=server",
     "--debug", "--all", "--version",

@@ -8,6 +8,9 @@ use crate::data_structures::Theme;
 use crate::helpers;
 
 const MAX_COLUMN_WIDTH: usize = 60;
+const COLUMN_SPACING: u16 = 2;
+/// The `▶ ` in front of the selected row.
+const HIGHLIGHT_WIDTH: u16 = 2;
 
 /// Tabular command output (kubectl's aligned columns or helm's JSON) as headers + rows.
 #[derive(Default)]
@@ -130,7 +133,20 @@ impl KubeTable {
                 *width = (*width).max(cell.chars().count());
             }
         }
-        let constraints = widths.iter().map(|w| Constraint::Length((*w).min(MAX_COLUMN_WIDTH) as u16));
+        // When the columns don't all fit, those on the right give way, one after the other. Left to
+        // the layout, every column shrinks, which cuts the NAME you act on. The last column takes
+        // whatever is left, as it is usually free text (flux's MESSAGE).
+        let mut left = block.inner(area).width.saturating_sub(HIGHLIGHT_WIDTH) as usize;
+        let last = widths.len().saturating_sub(1);
+        let constraints: Vec<Constraint> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, width)| {
+                let width = (*width).min(MAX_COLUMN_WIDTH).min(left);
+                left = left.saturating_sub(width + COLUMN_SPACING as usize);
+                if i == last { Constraint::Fill(1) } else { Constraint::Length(width as u16) }
+            })
+            .collect();
 
         // Only the rows that fit are built: with thousands of pods, building every row on
         // every frame made scrolling lag. The scroll offset is kept in `state` as ratatui would.
@@ -168,7 +184,7 @@ impl KubeTable {
         let table = Table::new(rows, constraints)
             .header(header)
             .block(block)
-            .column_spacing(2)
+            .column_spacing(COLUMN_SPACING)
             .row_highlight_style(theme.selected())
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(table, area, &mut window_state);
